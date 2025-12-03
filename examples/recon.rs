@@ -1,4 +1,4 @@
-//! # Web Recon Tool - Bug Bounty Edition v4
+//! # Web Recon Tool - Bug Bounty Edition v5
 //!
 //! Advanced security research tool with request interception, cookie dumping,
 //! XHR replay, secret scanning, and automatic security issue detection.
@@ -10,12 +10,18 @@
 //! - Secret scanning via Network.searchInResponseBody
 //! - Auto security issues via Audits.issueAdded
 //!
-//! ## TIER 2 Features (NEW):
+//! ## TIER 2 Features:
 //! - Raw cookies via Network.requestWillBeSentExtraInfo
 //! - Blocked cookies/HSTS via Network.responseReceivedExtraInfo
 //! - SSE streams via Network.eventSourceMessageReceived
 //! - Direct storage dump via DOMStorage.getDOMStorageItems
 //! - SSL/TLS state via Security.visibleSecurityStateChanged
+//!
+//! ## TIER 3 Features (NEW):
+//! - IndexedDB enumeration via IndexedDB.requestDatabaseNames/requestData
+//! - CacheStorage inspection via CacheStorage.requestCacheNames/requestEntries
+//! - Console log capture via Runtime.consoleAPICalled
+//! - WebTransport session tracking via Network.webTransport* events
 //!
 //! ## Usage
 //! ```bash
@@ -32,6 +38,8 @@ use chromiumoxide::cdp::browser_protocol::network::{
     // TIER 2
     EventRequestWillBeSentExtraInfo, EventResponseReceivedExtraInfo,
     EventEventSourceMessageReceived,
+    // TIER 3: WebTransport
+    EventWebTransportCreated, EventWebTransportConnectionEstablished, EventWebTransportClosed,
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     EnableParams as FetchEnableParams, EventRequestPaused,
@@ -49,6 +57,20 @@ use chromiumoxide::cdp::browser_protocol::dom_storage::{
 use chromiumoxide::cdp::browser_protocol::security::{
     EnableParams as SecurityEnableParams,
     EventVisibleSecurityStateChanged,
+};
+// TIER 3: IndexedDB, CacheStorage, Console/Log
+use chromiumoxide::cdp::browser_protocol::indexed_db::{
+    EnableParams as IndexedDbEnableParams,
+    RequestDatabaseNamesParams, RequestDatabaseParams, RequestDataParams,
+};
+use chromiumoxide::cdp::browser_protocol::cache_storage::{
+    RequestCacheNamesParams, RequestEntriesParams,
+};
+use chromiumoxide::cdp::browser_protocol::log::{
+    EnableParams as LogEnableParams, EventEntryAdded,
+};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    EnableParams as RuntimeEnableParams, EventConsoleApiCalled,
 };
 use chromiumoxide::Page;
 use futures::StreamExt;
@@ -238,6 +260,83 @@ pub struct CertificateInfo {
 }
 
 // ============================================================================
+// TIER 3: IndexedDB, CacheStorage, Console, WebTransport Structures
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedDbDatabase {
+    pub origin: String,
+    pub name: String,
+    pub version: f64,
+    pub object_stores: Vec<IndexedDbObjectStore>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedDbObjectStore {
+    pub name: String,
+    pub key_path: String,
+    pub auto_increment: bool,
+    pub indexes: Vec<String>,
+    pub entries: Vec<IndexedDbEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedDbEntry {
+    pub key: String,
+    pub value: String, // JSON stringified
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStorageCache {
+    pub security_origin: String,
+    pub cache_name: String,
+    pub cache_id: String,
+    pub entries: Vec<CacheStorageEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStorageEntry {
+    pub request_url: String,
+    pub request_method: String,
+    pub response_status: i64,
+    pub response_type: String,
+    pub response_time: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleMessage {
+    pub level: String,        // log, warn, error, info, debug
+    pub source: String,       // javascript, network, security, etc.
+    pub text: String,
+    pub url: Option<String>,
+    pub line_number: Option<i64>,
+    pub timestamp: f64,
+    pub args: Vec<String>,    // Stringified arguments
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogMessage {
+    pub level: String,
+    pub source: String,
+    pub text: String,
+    pub url: Option<String>,
+    pub line_number: Option<i64>,
+    pub category: Option<String>,
+    pub network_request_id: Option<String>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebTransportSession {
+    pub transport_id: String,
+    pub url: String,
+    pub initiator_origin: Option<String>,
+    pub created_at: u64,
+    pub established_at: Option<u64>,
+    pub closed_at: Option<u64>,
+}
+
+// ============================================================================
 // WebSocket Structures
 // ============================================================================
 
@@ -396,6 +495,13 @@ pub struct ReconReport {
     pub storage_items: Vec<StorageItem>,
     pub security_state: Option<SecurityState>,
 
+    // TIER 3: Deep inspection data
+    pub indexed_databases: Vec<IndexedDbDatabase>,
+    pub cache_storage: Vec<CacheStorageCache>,
+    pub console_messages: Vec<ConsoleMessage>,
+    pub log_messages: Vec<LogMessage>,
+    pub webtransport_sessions: Vec<WebTransportSession>,
+
     // WebSocket
     pub websocket_connections: Vec<WebSocketConnection>,
 
@@ -498,6 +604,13 @@ struct ReconEngine {
     storage_items: Mutex<Vec<StorageItem>>,
     security_state: Mutex<Option<SecurityState>>,
 
+    // TIER 3: Deep inspection
+    indexed_databases: Mutex<Vec<IndexedDbDatabase>>,
+    cache_storage: Mutex<Vec<CacheStorageCache>>,
+    console_messages: Mutex<Vec<ConsoleMessage>>,
+    log_messages: Mutex<Vec<LogMessage>>,
+    webtransport_sessions: Mutex<HashMap<String, WebTransportSession>>,
+
     // WebSocket connections
     websockets: Mutex<HashMap<String, WebSocketConnection>>,
 
@@ -545,6 +658,12 @@ impl ReconEngine {
             sse_messages: Mutex::new(Vec::new()),
             storage_items: Mutex::new(Vec::new()),
             security_state: Mutex::new(None),
+            // TIER 3
+            indexed_databases: Mutex::new(Vec::new()),
+            cache_storage: Mutex::new(Vec::new()),
+            console_messages: Mutex::new(Vec::new()),
+            log_messages: Mutex::new(Vec::new()),
+            webtransport_sessions: Mutex::new(HashMap::new()),
             websockets: Mutex::new(HashMap::new()),
             seen_urls: Mutex::new(HashSet::new()),
             apis: Mutex::new(Vec::new()),
@@ -1403,6 +1522,244 @@ impl ReconEngine {
     }
 
     // ========================================================================
+    // TIER 3: IndexedDB Enumeration
+    // ========================================================================
+
+    async fn dump_indexed_db(&self, page: &Page, origin: &str) {
+        println!("[*] Dumping IndexedDB for {}...", origin);
+
+        // First, get list of database names
+        let params = RequestDatabaseNamesParams::builder()
+            .security_origin(origin)
+            .build();
+
+        if let Ok(response) = page.execute(params).await {
+            for db_name in &response.database_names {
+                println!("  [IndexedDB] Found database: {}", db_name);
+
+                // Get database details
+                let db_params = RequestDatabaseParams::builder()
+                    .security_origin(origin)
+                    .database_name(db_name.clone())
+                    .build();
+
+                if let Ok(db_params) = db_params {
+                if let Ok(db_response) = page.execute(db_params).await {
+                    let db_info = &db_response.database_with_object_stores;
+                    let mut object_stores = Vec::new();
+
+                    for store in &db_info.object_stores {
+                        println!("    [ObjectStore] {} (keyPath: {:?}, autoIncrement: {})",
+                            store.name, store.key_path, store.auto_increment);
+
+                        let indexes: Vec<String> = store.indexes.iter()
+                            .map(|idx| idx.name.clone())
+                            .collect();
+
+                        // Try to get some data from the object store
+                        let mut entries = Vec::new();
+                        let data_params = RequestDataParams::builder()
+                            .security_origin(origin)
+                            .database_name(db_name.clone())
+                            .object_store_name(store.name.clone())
+                            .index_name("")
+                            .skip_count(0)
+                            .page_size(100) // Limit to first 100 entries
+                            .build();
+
+                        if let Ok(data_params) = data_params {
+                            if let Ok(data_response) = page.execute(data_params).await {
+                                for data_entry in &data_response.object_store_data_entries {
+                                    let key = format!("{:?}", data_entry.key);
+                                    let value = format!("{:?}", data_entry.value);
+                                    println!("      [Entry] key={} value={}",
+                                        truncate(&key, 30), truncate(&value, 50));
+                                    entries.push(IndexedDbEntry {
+                                        key,
+                                        value,
+                                    });
+                                }
+                            }
+                        }
+
+                        let key_path_str = format!("{:?}", store.key_path);
+                        object_stores.push(IndexedDbObjectStore {
+                            name: store.name.clone(),
+                            key_path: key_path_str,
+                            auto_increment: store.auto_increment,
+                            indexes,
+                            entries,
+                        });
+                    }
+
+                    self.indexed_databases.lock().await.push(IndexedDbDatabase {
+                        origin: origin.to_string(),
+                        name: db_info.name.clone(),
+                        version: db_info.version,
+                        object_stores,
+                    });
+                }
+                } // Close if let Ok(db_params)
+            }
+        }
+    }
+
+    // ========================================================================
+    // TIER 3: CacheStorage Inspection
+    // ========================================================================
+
+    async fn dump_cache_storage(&self, page: &Page, origin: &str) {
+        println!("[*] Dumping CacheStorage for {}...", origin);
+
+        let params = RequestCacheNamesParams::builder()
+            .security_origin(origin)
+            .build();
+
+        if let Ok(response) = page.execute(params).await {
+            for cache in &response.caches {
+                println!("  [CacheStorage] Found cache: {}", cache.cache_name);
+
+                let entries_params = RequestEntriesParams::builder()
+                    .cache_id(cache.cache_id.clone())
+                    .skip_count(0)
+                    .page_size(100)
+                    .build();
+
+                if let Ok(entries_params) = entries_params {
+                    let mut entries = Vec::new();
+
+                    if let Ok(entries_response) = page.execute(entries_params).await {
+                        for entry in &entries_response.cache_data_entries {
+                            println!("    [Cached] {} {} -> {} {:?}",
+                                entry.request_method,
+                                truncate(&entry.request_url, 50),
+                                entry.response_status,
+                                entry.response_type);
+
+                            entries.push(CacheStorageEntry {
+                                request_url: entry.request_url.clone(),
+                                request_method: entry.request_method.clone(),
+                                response_status: entry.response_status,
+                                response_type: format!("{:?}", entry.response_type),
+                                response_time: entry.response_time,
+                            });
+                        }
+                    }
+
+                    self.cache_storage.lock().await.push(CacheStorageCache {
+                        security_origin: origin.to_string(),
+                        cache_name: cache.cache_name.clone(),
+                        cache_id: cache.cache_id.inner().clone(),
+                        entries,
+                    });
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // TIER 3: Console Message Capture
+    // ========================================================================
+
+    async fn handle_console_api_called(&self, event: &EventConsoleApiCalled) {
+        let level = format!("{:?}", event.r#type);
+        let timestamp = *event.timestamp.inner();
+
+        // Convert args to strings
+        let args: Vec<String> = event.args.iter()
+            .map(|arg| {
+                arg.description.clone()
+                    .or_else(|| arg.value.as_ref().map(|v| v.to_string()))
+                    .unwrap_or_else(|| format!("{:?}", arg.r#type))
+            })
+            .collect();
+
+        let text = args.join(" ");
+
+        // Extract URL/line from stack trace if available
+        let (url, line_number) = event.stack_trace.as_ref()
+            .and_then(|st| st.call_frames.first())
+            .map(|frame| (Some(frame.url.clone()), Some(frame.line_number as i64)))
+            .unwrap_or((None, None));
+
+        println!("  [CONSOLE:{}] {}", level, truncate(&text, 80));
+
+        self.console_messages.lock().await.push(ConsoleMessage {
+            level,
+            source: "console".to_string(),
+            text,
+            url,
+            line_number,
+            timestamp,
+            args,
+        });
+    }
+
+    // ========================================================================
+    // TIER 3: Log Entry Capture
+    // ========================================================================
+
+    async fn handle_log_entry(&self, event: &EventEntryAdded) {
+        let entry = &event.entry;
+        let level = format!("{:?}", entry.level);
+        let source = format!("{:?}", entry.source);
+        let timestamp = *entry.timestamp.inner();
+
+        println!("  [LOG:{}:{}] {}", source, level, truncate(&entry.text, 80));
+
+        self.log_messages.lock().await.push(LogMessage {
+            level,
+            source,
+            text: entry.text.clone(),
+            url: entry.url.clone(),
+            line_number: entry.line_number,
+            category: entry.category.as_ref().map(|c| format!("{:?}", c)),
+            network_request_id: entry.network_request_id.as_ref().map(|id| id.inner().clone()),
+            timestamp,
+        });
+    }
+
+    // ========================================================================
+    // TIER 3: WebTransport Session Tracking
+    // ========================================================================
+
+    async fn handle_webtransport_created(&self, event: &EventWebTransportCreated) {
+        let transport_id = event.transport_id.inner().to_string();
+        let url = event.url.clone();
+
+        println!("  [WEBTRANSPORT:CREATED] {} -> {}", transport_id, truncate(&url, 60));
+
+        let session = WebTransportSession {
+            transport_id: transport_id.clone(),
+            url,
+            initiator_origin: event.initiator.as_ref().and_then(|i| i.url.clone()),
+            created_at: chrono::Utc::now().timestamp_millis() as u64,
+            established_at: None,
+            closed_at: None,
+        };
+
+        self.webtransport_sessions.lock().await.insert(transport_id, session);
+    }
+
+    async fn handle_webtransport_established(&self, event: &EventWebTransportConnectionEstablished) {
+        let transport_id = event.transport_id.inner().to_string();
+        println!("  [WEBTRANSPORT:ESTABLISHED] {}", transport_id);
+
+        if let Some(session) = self.webtransport_sessions.lock().await.get_mut(&transport_id) {
+            session.established_at = Some(chrono::Utc::now().timestamp_millis() as u64);
+        }
+    }
+
+    async fn handle_webtransport_closed(&self, event: &EventWebTransportClosed) {
+        let transport_id = event.transport_id.inner().to_string();
+        println!("  [WEBTRANSPORT:CLOSED] {}", transport_id);
+
+        if let Some(session) = self.webtransport_sessions.lock().await.get_mut(&transport_id) {
+            session.closed_at = Some(chrono::Utc::now().timestamp_millis() as u64);
+        }
+    }
+
+    // ========================================================================
     // Auth Flow Tracking
     // ========================================================================
 
@@ -1893,6 +2250,12 @@ impl ReconEngine {
             sse_messages: self.sse_messages.lock().await.clone(),
             storage_items: self.storage_items.lock().await.clone(),
             security_state: self.security_state.lock().await.clone(),
+            // TIER 3
+            indexed_databases: self.indexed_databases.lock().await.clone(),
+            cache_storage: self.cache_storage.lock().await.clone(),
+            console_messages: self.console_messages.lock().await.clone(),
+            log_messages: self.log_messages.lock().await.clone(),
+            webtransport_sessions: self.webtransport_sessions.lock().await.values().cloned().collect(),
             websocket_connections: websockets.values().cloned().collect(),
             login_forms: self.login_forms.lock().await.clone(),
             registration_forms: self.registration_forms.lock().await.clone(),
@@ -2098,6 +2461,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[*] Enabling Security domain...");
     page.execute(SecurityEnableParams::default()).await?;
 
+    // TIER 3: Enable IndexedDB domain
+    println!("[*] Enabling IndexedDB domain...");
+    page.execute(IndexedDbEnableParams::default()).await?;
+
+    // TIER 3: Enable Log domain
+    println!("[*] Enabling Log domain...");
+    page.execute(LogEnableParams::default()).await?;
+
+    // TIER 3: Enable Runtime domain (for console)
+    println!("[*] Enabling Runtime domain...");
+    page.execute(RuntimeEnableParams::default()).await?;
+
     // Enable Fetch domain for interception if requested
     if intercept_mode {
         println!("[*] Enabling Fetch domain for interception...");
@@ -2204,6 +2579,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // TIER 3: Console API handler
+    let mut console_events = page.event_listener::<EventConsoleApiCalled>().await?;
+    let engine_console = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = console_events.next().await {
+            engine_console.handle_console_api_called(&event).await;
+        }
+    });
+
+    // TIER 3: Log entry handler
+    let mut log_events = page.event_listener::<EventEntryAdded>().await?;
+    let engine_log = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = log_events.next().await {
+            engine_log.handle_log_entry(&event).await;
+        }
+    });
+
+    // TIER 3: WebTransport handlers
+    let mut wt_created_events = page.event_listener::<EventWebTransportCreated>().await?;
+    let mut wt_established_events = page.event_listener::<EventWebTransportConnectionEstablished>().await?;
+    let mut wt_closed_events = page.event_listener::<EventWebTransportClosed>().await?;
+
+    let engine_wt1 = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = wt_created_events.next().await {
+            engine_wt1.handle_webtransport_created(&event).await;
+        }
+    });
+    let engine_wt2 = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = wt_established_events.next().await {
+            engine_wt2.handle_webtransport_established(&event).await;
+        }
+    });
+    let engine_wt3 = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = wt_closed_events.next().await {
+            engine_wt3.handle_webtransport_closed(&event).await;
+        }
+    });
+
     // Intercept handler (TIER 1)
     if intercept_mode {
         let mut intercept_events = page.event_listener::<EventRequestPaused>().await?;
@@ -2250,6 +2667,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let origin = url::Url::parse(target).ok().map(|u| u.origin().ascii_serialization()).unwrap_or_default();
     if !origin.is_empty() {
         engine.dump_dom_storage(&page, &origin).await;
+
+        // TIER 3: Dump IndexedDB
+        engine.dump_indexed_db(&page, &origin).await;
+
+        // TIER 3: Dump CacheStorage
+        engine.dump_cache_storage(&page, &origin).await;
     }
 
     // Fetch bodies with secret scanning
@@ -2285,7 +2708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report
     println!("\n{}", "═".repeat(70));
-    println!(" RECON REPORT v4 - TIER 1 + TIER 2");
+    println!(" RECON REPORT v5 - TIER 1 + TIER 2 + TIER 3");
     println!("{}", "═".repeat(70));
 
     let report = engine.generate_report(target, cookie_jar).await;
@@ -2323,6 +2746,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("  Modern SSL: {}, Obsolete: {}", cert.modern_ssl,
                 cert.obsolete_ssl_protocol || cert.obsolete_ssl_cipher);
+        }
+    }
+
+    println!("\n--- TIER 3: Deep Inspection ---");
+    println!("IndexedDB Databases: {}", report.indexed_databases.len());
+    let total_object_stores: usize = report.indexed_databases.iter().map(|db| db.object_stores.len()).sum();
+    println!("IndexedDB Object Stores: {}", total_object_stores);
+    println!("CacheStorage Caches: {}", report.cache_storage.len());
+    let total_cached_entries: usize = report.cache_storage.iter().map(|c| c.entries.len()).sum();
+    println!("Cached Entries: {}", total_cached_entries);
+    println!("Console Messages: {}", report.console_messages.len());
+    let console_errors = report.console_messages.iter().filter(|m| m.level.to_lowercase().contains("error")).count();
+    if console_errors > 0 {
+        println!("  Console Errors: {}", console_errors);
+    }
+    println!("Log Messages: {}", report.log_messages.len());
+    println!("WebTransport Sessions: {}", report.webtransport_sessions.len());
+
+    if !report.indexed_databases.is_empty() {
+        println!("\n--- INDEXEDDB DATABASES ---");
+        for db in &report.indexed_databases {
+            println!("  [DB] {} v{} ({} stores)", db.name, db.version, db.object_stores.len());
+            for store in &db.object_stores {
+                println!("    [Store] {} ({} entries, autoInc: {})",
+                    store.name, store.entries.len(), store.auto_increment);
+            }
+        }
+    }
+
+    if !report.cache_storage.is_empty() {
+        println!("\n--- CACHE STORAGE ---");
+        for cache in &report.cache_storage {
+            println!("  [Cache] {} ({} entries)", cache.cache_name, cache.entries.len());
+            for entry in cache.entries.iter().take(5) {
+                println!("    {} {} -> {}", entry.request_method, truncate(&entry.request_url, 40), entry.response_status);
+            }
+        }
+    }
+
+    if !report.console_messages.is_empty() {
+        println!("\n--- CONSOLE MESSAGES (first 10) ---");
+        for msg in report.console_messages.iter().take(10) {
+            println!("  [{}] {}", msg.level, truncate(&msg.text, 60));
         }
     }
 
