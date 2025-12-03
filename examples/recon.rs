@@ -3,12 +3,19 @@
 //! Advanced security research tool with request interception, cookie dumping,
 //! XHR replay, secret scanning, and automatic security issue detection.
 //!
-//! ## TIER 1 Features (NEW):
+//! ## TIER 1 Features:
 //! - Request interception via Fetch domain (modify/block requests)
 //! - Full cookie jar dump via Network.getCookies
 //! - XHR replay via Network.replayXHR
 //! - Secret scanning via Network.searchInResponseBody
 //! - Auto security issues via Audits.issueAdded
+//!
+//! ## TIER 2 Features (NEW):
+//! - Raw cookies via Network.requestWillBeSentExtraInfo
+//! - Blocked cookies/HSTS via Network.responseReceivedExtraInfo
+//! - SSE streams via Network.eventSourceMessageReceived
+//! - Direct storage dump via DOMStorage.getDOMStorageItems
+//! - SSL/TLS state via Security.visibleSecurityStateChanged
 //!
 //! ## Usage
 //! ```bash
@@ -22,6 +29,9 @@ use chromiumoxide::cdp::browser_protocol::network::{
     EventWebSocketClosed, GetRequestPostDataParams, GetResponseBodyParams,
     GetCookiesParams, ReplayXhrParams, SearchInResponseBodyParams,
     RequestId,
+    // TIER 2
+    EventRequestWillBeSentExtraInfo, EventResponseReceivedExtraInfo,
+    EventEventSourceMessageReceived,
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     EnableParams as FetchEnableParams, EventRequestPaused,
@@ -29,6 +39,16 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::audits::{
     EnableParams as AuditsEnableParams, EventIssueAdded,
+};
+// TIER 2: DOMStorage and Security
+use chromiumoxide::cdp::browser_protocol::dom_storage::{
+    EnableParams as DomStorageEnableParams,
+    GetDomStorageItemsParams, StorageId,
+    EventDomStorageItemAdded, EventDomStorageItemUpdated,
+};
+use chromiumoxide::cdp::browser_protocol::security::{
+    EnableParams as SecurityEnableParams,
+    EventVisibleSecurityStateChanged,
 };
 use chromiumoxide::Page;
 use futures::StreamExt;
@@ -148,6 +168,73 @@ pub struct XhrReplayResult {
     pub replayed: bool,
     pub error: Option<String>,
     pub timestamp: u64,
+}
+
+// ============================================================================
+// TIER 2: New Structures
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssociatedCookieInfo {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub blocked: bool,
+    pub blocked_reasons: Vec<String>,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedCookieInfo {
+    pub name: String,
+    pub value: Option<String>,
+    pub blocked_reasons: Vec<String>,
+    pub request_id: String,
+    pub cookie_line: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SSEMessage {
+    pub request_id: String,
+    pub event_name: String,
+    pub event_id: String,
+    pub data: String,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageItem {
+    pub storage_type: String, // "localStorage" or "sessionStorage"
+    pub origin: String,
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityState {
+    pub security_state: String,
+    pub certificate_security_state: Option<CertificateInfo>,
+    pub safety_tip: Option<String>,
+    pub secure_origin: bool,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateInfo {
+    pub protocol: Option<String>,
+    pub key_exchange: Option<String>,
+    pub cipher: Option<String>,
+    pub certificate_has_weak_signature: bool,
+    pub certificate_has_sha1_signature: bool,
+    pub modern_ssl: bool,
+    pub obsolete_ssl_protocol: bool,
+    pub obsolete_ssl_key_exchange: bool,
+    pub obsolete_ssl_cipher: bool,
+    pub subject_name: Option<String>,
+    pub issuer: Option<String>,
+    pub valid_from: Option<f64>,
+    pub valid_to: Option<f64>,
 }
 
 // ============================================================================
@@ -302,6 +389,13 @@ pub struct ReconReport {
     pub secrets_found: Vec<SecretMatch>,
     pub security_issues: Vec<SecurityIssue>,
 
+    // TIER 2: Enhanced data
+    pub associated_cookies: Vec<AssociatedCookieInfo>,
+    pub blocked_cookies: Vec<BlockedCookieInfo>,
+    pub sse_messages: Vec<SSEMessage>,
+    pub storage_items: Vec<StorageItem>,
+    pub security_state: Option<SecurityState>,
+
     // WebSocket
     pub websocket_connections: Vec<WebSocketConnection>,
 
@@ -397,6 +491,13 @@ struct ReconEngine {
     xhr_replays: Mutex<Vec<XhrReplayResult>>,
     intercept_mode: bool,
 
+    // TIER 2: Enhanced captures
+    associated_cookies: Mutex<Vec<AssociatedCookieInfo>>,
+    blocked_cookies: Mutex<Vec<BlockedCookieInfo>>,
+    sse_messages: Mutex<Vec<SSEMessage>>,
+    storage_items: Mutex<Vec<StorageItem>>,
+    security_state: Mutex<Option<SecurityState>>,
+
     // WebSocket connections
     websockets: Mutex<HashMap<String, WebSocketConnection>>,
 
@@ -438,6 +539,12 @@ impl ReconEngine {
             xhr_requests: Mutex::new(Vec::new()),
             xhr_replays: Mutex::new(Vec::new()),
             intercept_mode,
+            // TIER 2
+            associated_cookies: Mutex::new(Vec::new()),
+            blocked_cookies: Mutex::new(Vec::new()),
+            sse_messages: Mutex::new(Vec::new()),
+            storage_items: Mutex::new(Vec::new()),
+            security_state: Mutex::new(None),
             websockets: Mutex::new(HashMap::new()),
             seen_urls: Mutex::new(HashSet::new()),
             apis: Mutex::new(Vec::new()),
@@ -1038,6 +1145,264 @@ impl ReconEngine {
     }
 
     // ========================================================================
+    // TIER 2: Raw Cookie Capture (requestWillBeSentExtraInfo)
+    // ========================================================================
+
+    async fn handle_request_extra_info(&self, event: &EventRequestWillBeSentExtraInfo) {
+        let request_id = event.request_id.inner().to_string();
+
+        for assoc_cookie in &event.associated_cookies {
+            let blocked = !assoc_cookie.blocked_reasons.is_empty();
+            let blocked_reasons: Vec<String> = assoc_cookie.blocked_reasons
+                .iter()
+                .map(|r| format!("{:?}", r))
+                .collect();
+
+            if blocked {
+                println!("  [COOKIE-BLOCKED] {} - {:?}", assoc_cookie.cookie.name, blocked_reasons);
+            }
+
+            let info = AssociatedCookieInfo {
+                name: assoc_cookie.cookie.name.clone(),
+                value: assoc_cookie.cookie.value.clone(),
+                domain: assoc_cookie.cookie.domain.clone(),
+                path: assoc_cookie.cookie.path.clone(),
+                blocked,
+                blocked_reasons,
+                request_id: request_id.clone(),
+            };
+
+            self.associated_cookies.lock().await.push(info);
+        }
+    }
+
+    // ========================================================================
+    // TIER 2: Blocked Cookie / Response Extra Info
+    // ========================================================================
+
+    async fn handle_response_extra_info(&self, event: &EventResponseReceivedExtraInfo) {
+        let request_id = event.request_id.inner().to_string();
+
+        for blocked in &event.blocked_cookies {
+            let blocked_reasons: Vec<String> = blocked.blocked_reasons
+                .iter()
+                .map(|r| format!("{:?}", r))
+                .collect();
+
+            // Try to get cookie name from the cookie or the cookie line
+            let (name, value, cookie_line) = if let Some(ref cookie) = blocked.cookie {
+                (cookie.name.clone(), Some(cookie.value.clone()), None)
+            } else {
+                // Parse from cookie line
+                let line = blocked.cookie_line.clone();
+                let name = line.split('=').next()
+                    .map(String::from)
+                    .unwrap_or_else(|| "unknown".to_string());
+                (name, None, Some(line))
+            };
+
+            println!("  [SET-COOKIE-BLOCKED] {} - {:?}", name, blocked_reasons);
+
+            let info = BlockedCookieInfo {
+                name,
+                value,
+                blocked_reasons,
+                request_id: request_id.clone(),
+                cookie_line,
+            };
+
+            self.blocked_cookies.lock().await.push(info);
+        }
+    }
+
+    // ========================================================================
+    // TIER 2: Server-Sent Events (SSE)
+    // ========================================================================
+
+    async fn handle_sse_message(&self, event: &EventEventSourceMessageReceived) {
+        let request_id = event.request_id.inner().to_string();
+
+        println!("  [SSE] {} event='{}' id='{}' data='{}'",
+            request_id,
+            event.event_name,
+            event.event_id,
+            truncate(&event.data, 50));
+
+        let msg = SSEMessage {
+            request_id,
+            event_name: event.event_name.clone(),
+            event_id: event.event_id.clone(),
+            data: event.data.clone(),
+            timestamp: *event.timestamp.inner(),
+        };
+
+        self.sse_messages.lock().await.push(msg);
+    }
+
+    // ========================================================================
+    // TIER 2: DOMStorage Direct Dump
+    // ========================================================================
+
+    async fn dump_dom_storage(&self, page: &Page, origin: &str) {
+        println!("[*] Dumping DOM storage for {}...", origin);
+
+        // localStorage
+        let local_storage_id = StorageId {
+            storage_key: None,
+            security_origin: Some(origin.to_string()),
+            is_local_storage: true,
+        };
+
+        if let Ok(response) = page.execute(GetDomStorageItemsParams::new(local_storage_id)).await {
+            for entry in &response.entries {
+                let items = entry.inner();
+                if items.len() >= 2 {
+                    let key = &items[0];
+                    let value = &items[1];
+                    println!("  [localStorage] {} = {}", key, truncate(value, 50));
+
+                    self.storage_items.lock().await.push(StorageItem {
+                        storage_type: "localStorage".to_string(),
+                        origin: origin.to_string(),
+                        key: key.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
+
+        // sessionStorage
+        let session_storage_id = StorageId {
+            storage_key: None,
+            security_origin: Some(origin.to_string()),
+            is_local_storage: false,
+        };
+
+        if let Ok(response) = page.execute(GetDomStorageItemsParams::new(session_storage_id)).await {
+            for entry in &response.entries {
+                let items = entry.inner();
+                if items.len() >= 2 {
+                    let key = &items[0];
+                    let value = &items[1];
+                    println!("  [sessionStorage] {} = {}", key, truncate(value, 50));
+
+                    self.storage_items.lock().await.push(StorageItem {
+                        storage_type: "sessionStorage".to_string(),
+                        origin: origin.to_string(),
+                        key: key.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn handle_storage_item_added(&self, event: &EventDomStorageItemAdded) {
+        let storage_type = if event.storage_id.is_local_storage { "localStorage" } else { "sessionStorage" };
+        let origin = event.storage_id.security_origin.clone().unwrap_or_default();
+
+        println!("  [STORAGE-ADD] [{}] {} = {}", storage_type, event.key, truncate(&event.new_value, 50));
+
+        self.storage_items.lock().await.push(StorageItem {
+            storage_type: storage_type.to_string(),
+            origin,
+            key: event.key.clone(),
+            value: event.new_value.clone(),
+        });
+    }
+
+    async fn handle_storage_item_updated(&self, event: &EventDomStorageItemUpdated) {
+        let storage_type = if event.storage_id.is_local_storage { "localStorage" } else { "sessionStorage" };
+
+        println!("  [STORAGE-UPDATE] [{}] {} = {} -> {}",
+            storage_type, event.key, truncate(&event.old_value, 20), truncate(&event.new_value, 30));
+
+        // Update existing or add new
+        let origin = event.storage_id.security_origin.clone().unwrap_or_default();
+        let mut items = self.storage_items.lock().await;
+        if let Some(item) = items.iter_mut().find(|i| i.key == event.key && i.storage_type == storage_type) {
+            item.value = event.new_value.clone();
+        } else {
+            items.push(StorageItem {
+                storage_type: storage_type.to_string(),
+                origin,
+                key: event.key.clone(),
+                value: event.new_value.clone(),
+            });
+        }
+    }
+
+    // ========================================================================
+    // TIER 2: Security State
+    // ========================================================================
+
+    async fn handle_security_state_changed(&self, event: &EventVisibleSecurityStateChanged) {
+        let state = &event.visible_security_state;
+        let security_state_str = format!("{:?}", state.security_state);
+
+        println!("  [SECURITY-STATE] {}", security_state_str);
+
+        let cert_info = state.certificate_security_state.as_ref().map(|cert| {
+            CertificateInfo {
+                protocol: Some(cert.protocol.clone()),
+                key_exchange: Some(cert.key_exchange.clone()),
+                cipher: Some(cert.cipher.clone()),
+                certificate_has_weak_signature: cert.certificate_has_weak_signature,
+                certificate_has_sha1_signature: cert.certificate_has_sha1_signature,
+                modern_ssl: cert.modern_ssl,
+                obsolete_ssl_protocol: cert.obsolete_ssl_protocol,
+                obsolete_ssl_key_exchange: cert.obsolete_ssl_key_exchange,
+                obsolete_ssl_cipher: cert.obsolete_ssl_cipher,
+                subject_name: Some(cert.subject_name.clone()),
+                issuer: Some(cert.issuer.clone()),
+                valid_from: Some(*cert.valid_from.inner()),
+                valid_to: Some(*cert.valid_to.inner()),
+            }
+        });
+
+        if let Some(ref cert) = cert_info {
+            if cert.obsolete_ssl_protocol || cert.obsolete_ssl_cipher || cert.obsolete_ssl_key_exchange {
+                println!("    [!] Obsolete SSL detected!");
+                self.security_issues.lock().await.push(SecurityIssue {
+                    issue_code: "ObsoleteSSL".to_string(),
+                    severity: "High".to_string(),
+                    description: "Obsolete SSL/TLS configuration detected".to_string(),
+                    affected_url: None,
+                    details: format!("Protocol: {:?}, Cipher: {:?}, KeyExchange: {:?}",
+                        cert.protocol, cert.cipher, cert.key_exchange),
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                });
+            }
+            if cert.certificate_has_weak_signature || cert.certificate_has_sha1_signature {
+                println!("    [!] Weak certificate signature!");
+                self.security_issues.lock().await.push(SecurityIssue {
+                    issue_code: "WeakCertificate".to_string(),
+                    severity: "Medium".to_string(),
+                    description: "Certificate has weak or SHA1 signature".to_string(),
+                    affected_url: None,
+                    details: format!("Subject: {:?}, Issuer: {:?}", cert.subject_name, cert.issuer),
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                });
+            }
+            if let (Some(subj), Some(proto)) = (&cert.subject_name, &cert.protocol) {
+                println!("    Certificate: {} via {}", subj, proto);
+            }
+        }
+
+        let safety_tip = state.safety_tip_info.as_ref().map(|tip| format!("{:?}", tip.safety_tip_status));
+
+        let sec_state = SecurityState {
+            security_state: security_state_str,
+            certificate_security_state: cert_info,
+            safety_tip,
+            secure_origin: state.security_state_issue_ids.is_empty(),
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        *self.security_state.lock().await = Some(sec_state);
+    }
+
+    // ========================================================================
     // Auth Flow Tracking
     // ========================================================================
 
@@ -1522,6 +1887,12 @@ impl ReconEngine {
             xhr_replays: self.xhr_replays.lock().await.clone(),
             secrets_found: self.secrets_found.lock().await.clone(),
             security_issues: self.security_issues.lock().await.clone(),
+            // TIER 2
+            associated_cookies: self.associated_cookies.lock().await.clone(),
+            blocked_cookies: self.blocked_cookies.lock().await.clone(),
+            sse_messages: self.sse_messages.lock().await.clone(),
+            storage_items: self.storage_items.lock().await.clone(),
+            security_state: self.security_state.lock().await.clone(),
             websocket_connections: websockets.values().cloned().collect(),
             login_forms: self.login_forms.lock().await.clone(),
             registration_forms: self.registration_forms.lock().await.clone(),
@@ -1693,7 +2064,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("all");
 
     println!("\n{}", "═".repeat(70));
-    println!(" WEB RECON TOOL v4 - TIER 1 Features");
+    println!(" WEB RECON TOOL v4 - TIER 1 + TIER 2 Features");
     println!(" Target: {}", target);
     println!(" Intercept Mode: {}", intercept_mode);
     println!("{}", "═".repeat(70));
@@ -1718,6 +2089,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Enable Audits domain for security issues
     println!("[*] Enabling Audits domain...");
     page.execute(AuditsEnableParams::default()).await?;
+
+    // TIER 2: Enable DOMStorage domain
+    println!("[*] Enabling DOMStorage domain...");
+    page.execute(DomStorageEnableParams::default()).await?;
+
+    // TIER 2: Enable Security domain
+    println!("[*] Enabling Security domain...");
+    page.execute(SecurityEnableParams::default()).await?;
 
     // Enable Fetch domain for interception if requested
     if intercept_mode {
@@ -1771,6 +2150,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // TIER 2: Request/Response Extra Info handlers
+    let mut req_extra_events = page.event_listener::<EventRequestWillBeSentExtraInfo>().await?;
+    let mut resp_extra_events = page.event_listener::<EventResponseReceivedExtraInfo>().await?;
+    let mut sse_events = page.event_listener::<EventEventSourceMessageReceived>().await?;
+    let mut storage_added_events = page.event_listener::<EventDomStorageItemAdded>().await?;
+    let mut storage_updated_events = page.event_listener::<EventDomStorageItemUpdated>().await?;
+    let mut security_events = page.event_listener::<EventVisibleSecurityStateChanged>().await?;
+
+    // TIER 2: Request Extra Info (raw cookies)
+    let engine_req_extra = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = req_extra_events.next().await {
+            engine_req_extra.handle_request_extra_info(&event).await;
+        }
+    });
+
+    // TIER 2: Response Extra Info (blocked cookies)
+    let engine_resp_extra = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = resp_extra_events.next().await {
+            engine_resp_extra.handle_response_extra_info(&event).await;
+        }
+    });
+
+    // TIER 2: SSE handler
+    let engine_sse = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = sse_events.next().await {
+            engine_sse.handle_sse_message(&event).await;
+        }
+    });
+
+    // TIER 2: Storage handlers
+    let engine_storage1 = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = storage_added_events.next().await {
+            engine_storage1.handle_storage_item_added(&event).await;
+        }
+    });
+    let engine_storage2 = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = storage_updated_events.next().await {
+            engine_storage2.handle_storage_item_updated(&event).await;
+        }
+    });
+
+    // TIER 2: Security state handler
+    let engine_security = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = security_events.next().await {
+            engine_security.handle_security_state_changed(&event).await;
+        }
+    });
+
     // Intercept handler (TIER 1)
     if intercept_mode {
         let mut intercept_events = page.event_listener::<EventRequestPaused>().await?;
@@ -1813,6 +2246,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TIER 1: Dump cookie jar
     let cookie_jar = engine.dump_cookie_jar(&page).await;
 
+    // TIER 2: Dump DOM storage directly via CDP
+    let origin = url::Url::parse(target).ok().map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+    if !origin.is_empty() {
+        engine.dump_dom_storage(&page, &origin).await;
+    }
+
     // Fetch bodies with secret scanning
     println!("\n[*] Fetching request/response bodies (with secret scanning)...");
     engine.fetch_pending_bodies(&page).await;
@@ -1846,7 +2285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report
     println!("\n{}", "═".repeat(70));
-    println!(" RECON REPORT v4 - TIER 1");
+    println!(" RECON REPORT v4 - TIER 1 + TIER 2");
     println!("{}", "═".repeat(70));
 
     let report = engine.generate_report(target, cookie_jar).await;
@@ -1868,6 +2307,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("XHR Replays: {}", report.xhr_replays.len());
     println!("Secrets Found: {}", report.secrets_found.len());
     println!("Security Issues: {}", report.security_issues.len());
+
+    println!("\n--- TIER 2: Enhanced Features ---");
+    println!("Associated Cookies (sent): {}", report.associated_cookies.len());
+    let blocked_sent = report.associated_cookies.iter().filter(|c| c.blocked).count();
+    println!("Blocked Cookies (sending): {}", blocked_sent);
+    println!("Blocked Cookies (set-cookie): {}", report.blocked_cookies.len());
+    println!("SSE Messages: {}", report.sse_messages.len());
+    println!("Storage Items: {}", report.storage_items.len());
+    if let Some(ref sec_state) = report.security_state {
+        println!("Security State: {} (Secure Origin: {})", sec_state.security_state, sec_state.secure_origin);
+        if let Some(ref cert) = sec_state.certificate_security_state {
+            if let Some(ref proto) = cert.protocol {
+                println!("  TLS Protocol: {}", proto);
+            }
+            println!("  Modern SSL: {}, Obsolete: {}", cert.modern_ssl,
+                cert.obsolete_ssl_protocol || cert.obsolete_ssl_cipher);
+        }
+    }
+
+    if !report.blocked_cookies.is_empty() {
+        println!("\n--- BLOCKED SET-COOKIES ---");
+        for cookie in report.blocked_cookies.iter().take(10) {
+            println!("  [!] {} - {:?}", cookie.name, cookie.blocked_reasons);
+        }
+    }
+
+    if !report.storage_items.is_empty() {
+        println!("\n--- STORAGE ITEMS ---");
+        for item in report.storage_items.iter().take(10) {
+            println!("  [{}] {} = {}", item.storage_type, item.key, truncate(&item.value, 40));
+        }
+    }
 
     if !report.secrets_found.is_empty() {
         println!("\n--- SECRETS FOUND ---");
@@ -1914,9 +2385,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n{}", "═".repeat(70));
-    println!(" Complete - TIER 1 Features Active");
-    println!(" {} requests | {} secrets | {} issues",
-        report.total_requests, report.secrets_found.len(), report.security_issues.len());
+    println!(" Complete - TIER 1 + TIER 2 Features Active");
+    println!(" {} requests | {} secrets | {} issues | {} storage items",
+        report.total_requests, report.secrets_found.len(), report.security_issues.len(), report.storage_items.len());
     println!("{}", "═".repeat(70));
 
     drop(req_handle);
