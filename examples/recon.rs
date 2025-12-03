@@ -1,7 +1,7 @@
-//! # Web Recon Tool - Bug Bounty Edition v2
+//! # Web Recon Tool - Bug Bounty Edition v3
 //!
 //! Advanced security research tool for capturing traffic and generating raw requests.
-//! Features: API discovery, auth detection, login flow testing, multi-format export.
+//! Features: Full body capture, WebSocket interception, auth flow tracking, multi-format export.
 //!
 //! ## Usage
 //! ```bash
@@ -11,7 +11,11 @@
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::{
     EventRequestWillBeSent, EventResponseReceived,
+    EventWebSocketCreated, EventWebSocketFrameSent, EventWebSocketFrameReceived,
+    EventWebSocketClosed, GetRequestPostDataParams, GetResponseBodyParams,
+    RequestId,
 };
+use chromiumoxide::Page;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +48,8 @@ pub struct RawResponse {
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub mime_type: String,
+    pub body: Option<String>,
+    pub body_size: Option<usize>,
     pub timestamp: u64,
 }
 
@@ -53,12 +59,38 @@ pub struct Cookie {
     pub value: String,
     pub domain: Option<String>,
     pub path: Option<String>,
+    pub expires: Option<String>,
+    pub http_only: bool,
+    pub secure: bool,
+    pub same_site: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestResponsePair {
     pub request: RawRequest,
     pub response: Option<RawResponse>,
+}
+
+// ============================================================================
+// WebSocket Structures
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketConnection {
+    pub request_id: String,
+    pub url: String,
+    pub initiator_url: Option<String>,
+    pub messages: Vec<WebSocketMessage>,
+    pub created_at: u64,
+    pub closed_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketMessage {
+    pub direction: String, // "sent" or "received"
+    pub opcode: f64,
+    pub payload: String,
+    pub timestamp: u64,
 }
 
 // ============================================================================
@@ -101,27 +133,35 @@ pub struct FormField {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFlow {
-    pub flow_type: String, // login, register, oauth, mfa
+    pub flow_type: String,
     pub steps: Vec<AuthFlowStep>,
     pub tokens_captured: Vec<CapturedToken>,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFlowStep {
     pub step_number: usize,
+    pub request_id: String,
     pub url: String,
+    pub method: String,
     pub action: String,
     pub tokens_received: Vec<String>,
     pub tokens_sent: Vec<String>,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapturedToken {
-    pub token_type: String, // csrf, session, jwt, oauth
+    pub token_type: String,
     pub name: String,
     pub value_preview: String,
-    pub location: String, // header, cookie, body, url
+    pub full_value: Option<String>, // For CSRF tokens that need to be replayed
+    pub location: String,
     pub first_seen_url: String,
+    pub first_seen_request_id: Option<String>,
+    pub timestamp: u64,
 }
 
 // ============================================================================
@@ -130,31 +170,31 @@ pub struct CapturedToken {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiEndpoint {
-    url: String,
-    method: String,
-    api_type: String,
-    has_auth: bool,
-    request_id: Option<String>,
+    pub url: String,
+    pub method: String,
+    pub api_type: String,
+    pub has_auth: bool,
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFinding {
-    auth_type: String,
-    location: String,
-    key_name: String,
-    sample: String,
+    pub auth_type: String,
+    pub location: String,
+    pub key_name: String,
+    pub sample: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntiBotFinding {
-    service: String,
-    indicator: String,
+    pub service: String,
+    pub indicator: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityFinding {
-    finding_type: String,
-    details: String,
+    pub finding_type: String,
+    pub details: String,
 }
 
 // ============================================================================
@@ -171,6 +211,9 @@ pub struct ReconReport {
     pub captured_requests: Vec<RawRequest>,
     pub captured_responses: Vec<RawResponse>,
     pub request_response_pairs: Vec<RequestResponsePair>,
+
+    // WebSocket
+    pub websocket_connections: Vec<WebSocketConnection>,
 
     // Auth flows
     pub login_forms: Vec<LoginForm>,
@@ -200,10 +243,30 @@ pub struct ReconReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphQLOperation {
     pub url: String,
-    pub operation_type: String, // query, mutation, subscription
+    pub operation_type: String,
     pub operation_name: Option<String>,
+    pub query: Option<String>,
     pub variables: Option<serde_json::Value>,
     pub request_id: String,
+}
+
+// ============================================================================
+// Pending Body Fetch
+// ============================================================================
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PendingRequest {
+    request_id: String,
+    has_post_data: bool,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PendingResponse {
+    request_id: String,
+    url: String,
+    mime_type: String,
 }
 
 // ============================================================================
@@ -213,7 +276,14 @@ pub struct GraphQLOperation {
 struct ReconEngine {
     // Raw capture
     requests: Mutex<HashMap<String, RawRequest>>,
-    responses: Mutex<Vec<RawResponse>>,
+    responses: Mutex<HashMap<String, RawResponse>>,
+
+    // Pending body fetches
+    pending_request_bodies: Mutex<Vec<PendingRequest>>,
+    pending_response_bodies: Mutex<Vec<PendingResponse>>,
+
+    // WebSocket connections
+    websockets: Mutex<HashMap<String, WebSocketConnection>>,
 
     // Deduplication
     seen_urls: Mutex<HashSet<String>>,
@@ -227,6 +297,8 @@ struct ReconEngine {
     captured_tokens: Mutex<Vec<CapturedToken>>,
     login_forms: Mutex<Vec<LoginForm>>,
     registration_forms: Mutex<Vec<RegistrationForm>>,
+    auth_flows: Mutex<Vec<AuthFlow>>,
+    current_auth_flow: Mutex<Option<AuthFlow>>,
 
     // Security
     antibot_findings: Mutex<Vec<AntiBotFinding>>,
@@ -243,7 +315,10 @@ impl ReconEngine {
     fn new() -> Self {
         Self {
             requests: Mutex::new(HashMap::new()),
-            responses: Mutex::new(Vec::new()),
+            responses: Mutex::new(HashMap::new()),
+            pending_request_bodies: Mutex::new(Vec::new()),
+            pending_response_bodies: Mutex::new(Vec::new()),
+            websockets: Mutex::new(HashMap::new()),
             seen_urls: Mutex::new(HashSet::new()),
             apis: Mutex::new(Vec::new()),
             graphql_ops: Mutex::new(Vec::new()),
@@ -251,6 +326,8 @@ impl ReconEngine {
             captured_tokens: Mutex::new(Vec::new()),
             login_forms: Mutex::new(Vec::new()),
             registration_forms: Mutex::new(Vec::new()),
+            auth_flows: Mutex::new(Vec::new()),
+            current_auth_flow: Mutex::new(None),
             antibot_findings: Mutex::new(Vec::new()),
             security_findings: Mutex::new(Vec::new()),
             interesting_urls: Mutex::new(Vec::new()),
@@ -261,7 +338,7 @@ impl ReconEngine {
     }
 
     // ========================================================================
-    // Request Capture & Analysis
+    // Request Capture
     // ========================================================================
 
     async fn capture_request(&self, event: &EventRequestWillBeSent) {
@@ -271,7 +348,6 @@ impl ReconEngine {
         let method = &event.request.method;
         let request_id = event.request_id.inner().to_string();
 
-        // Parse headers
         let headers: HashMap<String, String> = event
             .request
             .headers
@@ -284,55 +360,48 @@ impl ReconEngine {
             })
             .unwrap_or_default();
 
-        // Parse cookies from header
         let cookies = parse_cookies(headers.get("Cookie").or(headers.get("cookie")));
 
-        // Get content type
         let content_type = headers.get("Content-Type")
             .or(headers.get("content-type"))
             .cloned();
 
-        // Get body if available (from has_post_data flag - actual body needs Network.getRequestPostData)
-        let has_body = event.request.has_post_data.unwrap_or(false);
+        let has_post_data = event.request.has_post_data.unwrap_or(false);
 
-        // Create raw request
+        // Queue for body fetch if has POST data
+        if has_post_data {
+            self.pending_request_bodies.lock().await.push(PendingRequest {
+                request_id: request_id.clone(),
+                has_post_data: true,
+            });
+        }
+
         let raw_request = RawRequest {
             id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
             headers: headers.clone(),
             cookies,
-            body: if has_body { Some("[POST_DATA]".to_string()) } else { None },
+            body: None, // Will be filled later
             content_type: content_type.clone(),
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             initiator: event.initiator.url.clone(),
             resource_type: event.r#type.as_ref().map(|t| format!("{:?}", t)).unwrap_or_default(),
         };
 
-        // Store request
         self.requests.lock().await.insert(request_id.clone(), raw_request);
 
-        // Skip static for analysis (but keep in raw capture)
         if is_static(url) {
             return;
         }
 
-        // Analyze for APIs
+        // Analyze
         self.detect_api(url, method, &headers, Some(&request_id)).await;
-
-        // Check for GraphQL
-        self.detect_graphql(url, &headers, event.request.has_post_data.unwrap_or(false), &request_id).await;
-
-        // Detect auth tokens
-        self.capture_auth_tokens(url, &headers, "request").await;
-
-        // Check interesting
+        self.detect_graphql(url, &headers, has_post_data, &request_id).await;
+        self.capture_auth_tokens(url, &headers, "request", Some(&request_id)).await;
+        self.track_auth_flow_request(url, method, &headers, &request_id).await;
         self.check_interesting(url).await;
-
-        // Anti-bot in URL
         self.detect_antibot_url(url).await;
-
-        // Sensitive data
         self.check_sensitive_url(url).await;
     }
 
@@ -353,35 +422,41 @@ impl ReconEngine {
             })
             .unwrap_or_default();
 
-        // Create raw response
+        let mime_type = event.response.mime_type.clone();
+
+        // Queue for body fetch if it's a useful content type
+        if should_capture_body(&mime_type) {
+            self.pending_response_bodies.lock().await.push(PendingResponse {
+                request_id: request_id.clone(),
+                url: url.clone(),
+                mime_type: mime_type.clone(),
+            });
+        }
+
         let raw_response = RawResponse {
             request_id: request_id.clone(),
             url: url.clone(),
             status,
             status_text: event.response.status_text.clone(),
             headers: headers.clone(),
-            mime_type: event.response.mime_type.clone(),
+            mime_type: mime_type.clone(),
+            body: None,
+            body_size: None,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         };
 
-        self.responses.lock().await.push(raw_response);
+        self.responses.lock().await.insert(request_id.clone(), raw_response);
 
-        // Security headers check
         if !*self.checked_headers.lock().await {
             self.check_security_headers(&headers).await;
             *self.checked_headers.lock().await = true;
         }
 
-        // Capture tokens from response
-        self.capture_auth_tokens(url, &headers, "response").await;
-
-        // Capture Set-Cookie tokens
+        self.capture_auth_tokens(url, &headers, "response", Some(&request_id)).await;
         self.capture_set_cookie_tokens(url, &headers).await;
-
-        // Anti-bot detection
+        self.track_auth_flow_response(url, &headers, &request_id, status).await;
         self.detect_antibot_response(&headers).await;
 
-        // Status code analysis
         if status == 401 || status == 403 {
             println!("  [AUTH-REQUIRED] {} {} {}", status, event.response.status_text, truncate(url, 60));
         } else if status >= 500 {
@@ -392,7 +467,6 @@ impl ReconEngine {
             });
         }
 
-        // CORS check
         if let Some(cors) = headers.get("Access-Control-Allow-Origin").or(headers.get("access-control-allow-origin")) {
             if cors == "*" {
                 println!("  [CORS] Wildcard CORS: {}", truncate(url, 60));
@@ -405,22 +479,295 @@ impl ReconEngine {
     }
 
     // ========================================================================
-    // Token Capture
+    // Body Fetching (called after page load)
     // ========================================================================
 
-    async fn capture_auth_tokens(&self, url: &str, headers: &HashMap<String, String>, context: &str) {
+    async fn fetch_pending_bodies(&self, page: &Page) {
+        // Fetch request bodies
+        let pending_reqs = {
+            let mut pending = self.pending_request_bodies.lock().await;
+            std::mem::take(&mut *pending)
+        };
+
+        for pending in pending_reqs {
+            if let Ok(body) = self.fetch_request_body(page, &pending.request_id).await {
+                let mut requests = self.requests.lock().await;
+                if let Some(req) = requests.get_mut(&pending.request_id) {
+                    if !body.is_empty() {
+                        // Check if it's GraphQL and parse
+                        if req.url.to_lowercase().contains("graphql") {
+                            self.parse_graphql_body(&body, &pending.request_id).await;
+                        }
+                        println!("  [BODY] Request {} - {} bytes", truncate(&req.url, 40), body.len());
+                        req.body = Some(body);
+                    }
+                }
+            }
+        }
+
+        // Fetch response bodies
+        let pending_resps = {
+            let mut pending = self.pending_response_bodies.lock().await;
+            std::mem::take(&mut *pending)
+        };
+
+        for pending in pending_resps {
+            if let Ok((body, _base64)) = self.fetch_response_body(page, &pending.request_id).await {
+                let mut responses = self.responses.lock().await;
+                if let Some(resp) = responses.get_mut(&pending.request_id) {
+                    if !body.is_empty() {
+                        let size = body.len();
+                        // Truncate large bodies for storage
+                        let stored_body = if size > 50000 {
+                            format!("{}... [TRUNCATED - {} bytes total]", &body[..50000], size)
+                        } else {
+                            body
+                        };
+                        println!("  [BODY] Response {} - {} bytes", truncate(&pending.url, 40), size);
+                        resp.body = Some(stored_body);
+                        resp.body_size = Some(size);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fetch_request_body(&self, page: &Page, request_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let params = GetRequestPostDataParams::new(RequestId::from(request_id.to_string()));
+        let result = page.execute(params).await?;
+        Ok(result.post_data.clone())
+    }
+
+    async fn fetch_response_body(&self, page: &Page, request_id: &str) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
+        let params = GetResponseBodyParams::new(RequestId::from(request_id.to_string()));
+        let result = page.execute(params).await?;
+        Ok((result.body.clone(), result.base64_encoded))
+    }
+
+    async fn parse_graphql_body(&self, body: &str, request_id: &str) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+            let query = json.get("query").and_then(|q| q.as_str()).map(|s| s.to_string());
+            let variables = json.get("variables").cloned();
+            let operation_name = json.get("operationName").and_then(|n| n.as_str()).map(|s| s.to_string());
+
+            let operation_type = query.as_ref().map(|q| {
+                if q.trim().starts_with("mutation") {
+                    "mutation"
+                } else if q.trim().starts_with("subscription") {
+                    "subscription"
+                } else {
+                    "query"
+                }
+            }).unwrap_or("unknown").to_string();
+
+            let mut ops = self.graphql_ops.lock().await;
+            if let Some(op) = ops.iter_mut().find(|o| o.request_id == request_id) {
+                op.operation_type = operation_type;
+                op.operation_name = operation_name;
+                op.query = query;
+                op.variables = variables;
+                println!("  [GRAPHQL] {} - {:?}", op.operation_type, op.operation_name);
+            }
+        }
+    }
+
+    // ========================================================================
+    // WebSocket Capture
+    // ========================================================================
+
+    async fn handle_websocket_created(&self, event: &EventWebSocketCreated) {
+        let request_id = event.request_id.inner().to_string();
+        println!("  [WS-CREATED] {} -> {}", request_id, event.url);
+
+        let ws = WebSocketConnection {
+            request_id: request_id.clone(),
+            url: event.url.clone(),
+            initiator_url: event.initiator.as_ref().and_then(|i| i.url.clone()),
+            messages: Vec::new(),
+            created_at: chrono::Utc::now().timestamp_millis() as u64,
+            closed_at: None,
+        };
+
+        self.websockets.lock().await.insert(request_id, ws);
+    }
+
+    async fn handle_websocket_frame_sent(&self, event: &EventWebSocketFrameSent) {
+        let request_id = event.request_id.inner().to_string();
+
+        let msg = WebSocketMessage {
+            direction: "sent".to_string(),
+            opcode: event.response.opcode,
+            payload: event.response.payload_data.clone(),
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        let preview = truncate(&event.response.payload_data, 50);
+        println!("  [WS-SENT] {} -> {}", request_id, preview);
+
+        if let Some(ws) = self.websockets.lock().await.get_mut(&request_id) {
+            ws.messages.push(msg);
+        }
+    }
+
+    async fn handle_websocket_frame_received(&self, event: &EventWebSocketFrameReceived) {
+        let request_id = event.request_id.inner().to_string();
+
+        let msg = WebSocketMessage {
+            direction: "received".to_string(),
+            opcode: event.response.opcode,
+            payload: event.response.payload_data.clone(),
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        let preview = truncate(&event.response.payload_data, 50);
+        println!("  [WS-RECV] {} <- {}", request_id, preview);
+
+        if let Some(ws) = self.websockets.lock().await.get_mut(&request_id) {
+            ws.messages.push(msg);
+        }
+    }
+
+    async fn handle_websocket_closed(&self, event: &EventWebSocketClosed) {
+        let request_id = event.request_id.inner().to_string();
+        println!("  [WS-CLOSED] {}", request_id);
+
+        if let Some(ws) = self.websockets.lock().await.get_mut(&request_id) {
+            ws.closed_at = Some(chrono::Utc::now().timestamp_millis() as u64);
+        }
+    }
+
+    // ========================================================================
+    // Auth Flow Tracking
+    // ========================================================================
+
+    async fn track_auth_flow_request(&self, url: &str, method: &str, headers: &HashMap<String, String>, request_id: &str) {
+        let url_lower = url.to_lowercase();
+        let is_auth_endpoint = url_lower.contains("/login") || url_lower.contains("/signin")
+            || url_lower.contains("/auth") || url_lower.contains("/oauth")
+            || url_lower.contains("/token") || url_lower.contains("/session");
+
+        if !is_auth_endpoint {
+            return;
+        }
+
+        let tokens_sent: Vec<String> = {
+            let captured = self.captured_tokens.lock().await;
+            captured.iter()
+                .filter(|t| headers.values().any(|v| v.contains(&t.value_preview) ||
+                    (t.full_value.is_some() && v.contains(t.full_value.as_ref().unwrap()))))
+                .map(|t| format!("{}:{}", t.token_type, t.name))
+                .collect()
+        };
+
+        let step = AuthFlowStep {
+            step_number: 0,
+            request_id: request_id.to_string(),
+            url: url.to_string(),
+            method: method.to_string(),
+            action: "request".to_string(),
+            tokens_received: Vec::new(),
+            tokens_sent,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        let mut current_flow = self.current_auth_flow.lock().await;
+        if let Some(flow) = current_flow.as_mut() {
+            let step_num = flow.steps.len();
+            let mut step = step;
+            step.step_number = step_num;
+            flow.steps.push(step);
+        } else {
+            let mut new_flow = AuthFlow {
+                flow_type: if url_lower.contains("oauth") { "oauth".to_string() } else { "login".to_string() },
+                steps: vec![step],
+                tokens_captured: Vec::new(),
+                started_at: chrono::Utc::now().timestamp_millis() as u64,
+                completed_at: None,
+            };
+            new_flow.steps[0].step_number = 0;
+            *current_flow = Some(new_flow);
+            println!("  [AUTH-FLOW] Started tracking auth flow");
+        }
+    }
+
+    async fn track_auth_flow_response(&self, url: &str, headers: &HashMap<String, String>, request_id: &str, status: i64) {
+        let mut current_flow = self.current_auth_flow.lock().await;
+        if current_flow.is_none() {
+            return;
+        }
+
+        let flow = current_flow.as_mut().unwrap();
+
+        // Check for tokens in response
+        let tokens_received: Vec<String> = {
+            let mut tokens = Vec::new();
+
+            // Check Set-Cookie for session tokens
+            for (key, value) in headers.iter() {
+                if key.to_lowercase() == "set-cookie" {
+                    let cookie_name = value.split('=').next().unwrap_or("");
+                    if cookie_name.to_lowercase().contains("session") || cookie_name.to_lowercase().contains("token") {
+                        tokens.push(format!("cookie:{}", cookie_name));
+                    }
+                }
+            }
+
+            // Check for auth headers
+            if headers.contains_key("Authorization") || headers.contains_key("authorization") {
+                tokens.push("header:authorization".to_string());
+            }
+
+            tokens
+        };
+
+        // Add response step
+        let step = AuthFlowStep {
+            step_number: flow.steps.len(),
+            request_id: request_id.to_string(),
+            url: url.to_string(),
+            method: "RESPONSE".to_string(),
+            action: format!("response:{}", status),
+            tokens_received: tokens_received.clone(),
+            tokens_sent: Vec::new(),
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        flow.steps.push(step);
+
+        // Check if flow is complete (successful auth or redirect)
+        if (status == 200 || status == 302) && !tokens_received.is_empty() {
+            flow.completed_at = Some(chrono::Utc::now().timestamp_millis() as u64);
+
+            // Copy captured tokens
+            let captured = self.captured_tokens.lock().await;
+            flow.tokens_captured = captured.clone();
+
+            // Store completed flow
+            let completed_flow = flow.clone();
+            drop(current_flow);
+            self.auth_flows.lock().await.push(completed_flow);
+            *self.current_auth_flow.lock().await = None;
+
+            println!("  [AUTH-FLOW] Completed - {} steps, {} tokens",
+                self.auth_flows.lock().await.last().map(|f| f.steps.len()).unwrap_or(0),
+                self.auth_flows.lock().await.last().map(|f| f.tokens_captured.len()).unwrap_or(0));
+        }
+    }
+
+    // ========================================================================
+    // Token Capture (Enhanced)
+    // ========================================================================
+
+    async fn capture_auth_tokens(&self, url: &str, headers: &HashMap<String, String>, context: &str, request_id: Option<&str>) {
         let mut tokens = self.captured_tokens.lock().await;
         let mut findings = self.auth_findings.lock().await;
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
 
         // Authorization header
         if let Some(auth) = headers.get("Authorization").or(headers.get("authorization")) {
             let (token_type, auth_type_str) = if auth.starts_with("Bearer ") {
                 let token = &auth[7..];
-                if is_jwt(token) {
-                    ("jwt", "JWT")
-                } else {
-                    ("bearer", "Bearer Token")
-                }
+                if is_jwt(token) { ("jwt", "JWT") } else { ("bearer", "Bearer Token") }
             } else if auth.starts_with("Basic ") {
                 ("basic", "Basic Auth")
             } else {
@@ -433,8 +780,11 @@ impl ReconEngine {
                     token_type: token_type.to_string(),
                     name: "Authorization".to_string(),
                     value_preview: redact(auth),
+                    full_value: Some(auth.clone()),
                     location: "header".to_string(),
                     first_seen_url: url.to_string(),
+                    first_seen_request_id: request_id.map(|s| s.to_string()),
+                    timestamp,
                 });
 
                 if !findings.iter().any(|f| f.auth_type == auth_type_str) {
@@ -452,7 +802,6 @@ impl ReconEngine {
         let api_key_headers = [
             "X-API-Key", "x-api-key", "Api-Key", "api-key",
             "X-Auth-Token", "x-auth-token", "X-Access-Token", "x-access-token",
-            "X-Client-ID", "x-client-id", "X-Client-Secret", "x-client-secret",
         ];
 
         for key in &api_key_headers {
@@ -464,44 +813,44 @@ impl ReconEngine {
                         token_type: "api_key".to_string(),
                         name: key.to_string(),
                         value_preview: redact(value),
+                        full_value: Some(value.clone()),
                         location: "header".to_string(),
                         first_seen_url: url.to_string(),
+                        first_seen_request_id: request_id.map(|s| s.to_string()),
+                        timestamp,
                     });
-
-                    if !findings.iter().any(|f| f.key_name.to_lowercase() == key_lower) {
-                        findings.push(AuthFinding {
-                            auth_type: "API Key".to_string(),
-                            location: "header".to_string(),
-                            key_name: key.to_string(),
-                            sample: redact(value),
-                        });
-                    }
+                    findings.push(AuthFinding {
+                        auth_type: "API Key".to_string(),
+                        location: "header".to_string(),
+                        key_name: key.to_string(),
+                        sample: redact(value),
+                    });
                 }
             }
         }
 
-        // CSRF tokens
+        // CSRF tokens (capture full value for replay)
         let csrf_headers = ["X-CSRF-Token", "x-csrf-token", "X-XSRF-Token", "x-xsrf-token"];
         for key in &csrf_headers {
             if let Some(value) = headers.get(*key) {
-                if !tokens.iter().any(|t| t.token_type == "csrf") {
-                    println!("  [TOKEN] CSRF token captured");
+                if !tokens.iter().any(|t| t.token_type == "csrf" && t.name.to_lowercase() == key.to_lowercase()) {
+                    println!("  [TOKEN] CSRF token captured: {}", key);
                     tokens.push(CapturedToken {
                         token_type: "csrf".to_string(),
                         name: key.to_string(),
                         value_preview: redact(value),
+                        full_value: Some(value.clone()), // Full value for replay
                         location: "header".to_string(),
                         first_seen_url: url.to_string(),
+                        first_seen_request_id: request_id.map(|s| s.to_string()),
+                        timestamp,
                     });
-
-                    if !findings.iter().any(|f| f.auth_type == "CSRF Token") {
-                        findings.push(AuthFinding {
-                            auth_type: "CSRF Token".to_string(),
-                            location: "header".to_string(),
-                            key_name: key.to_string(),
-                            sample: "[PRESENT]".to_string(),
-                        });
-                    }
+                    findings.push(AuthFinding {
+                        auth_type: "CSRF Token".to_string(),
+                        location: "header".to_string(),
+                        key_name: key.to_string(),
+                        sample: redact(value),
+                    });
                 }
             }
         }
@@ -510,41 +859,47 @@ impl ReconEngine {
     async fn capture_set_cookie_tokens(&self, url: &str, headers: &HashMap<String, String>) {
         let mut tokens = self.captured_tokens.lock().await;
         let mut findings = self.auth_findings.lock().await;
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
 
-        // Check Set-Cookie headers
         for (key, value) in headers.iter() {
             if key.to_lowercase() == "set-cookie" {
-                let cookie_name = value.split('=').next().unwrap_or("").trim();
+                let cookie = parse_set_cookie(value);
+
                 let session_patterns = ["session", "sess", "sid", "token", "auth", "jwt", "csrf", "xsrf"];
+                let name_lower = cookie.name.to_lowercase();
 
                 for pattern in &session_patterns {
-                    if cookie_name.to_lowercase().contains(pattern) {
-                        if !tokens.iter().any(|t| t.name.to_lowercase() == cookie_name.to_lowercase()) {
-                            let token_type = if cookie_name.to_lowercase().contains("csrf") || cookie_name.to_lowercase().contains("xsrf") {
+                    if name_lower.contains(pattern) {
+                        if !tokens.iter().any(|t| t.name.to_lowercase() == name_lower && t.location == "cookie") {
+                            let token_type = if name_lower.contains("csrf") || name_lower.contains("xsrf") {
                                 "csrf"
-                            } else if cookie_name.to_lowercase().contains("jwt") {
+                            } else if name_lower.contains("jwt") || is_jwt(&cookie.value) {
                                 "jwt"
                             } else {
                                 "session"
                             };
 
-                            println!("  [TOKEN] Cookie set: {} ({})", cookie_name, token_type);
+                            println!("  [TOKEN] Cookie set: {} ({}) HttpOnly:{} Secure:{}",
+                                cookie.name, token_type, cookie.http_only, cookie.secure);
+
                             tokens.push(CapturedToken {
                                 token_type: token_type.to_string(),
-                                name: cookie_name.to_string(),
-                                value_preview: "[SET-COOKIE]".to_string(),
+                                name: cookie.name.clone(),
+                                value_preview: redact(&cookie.value),
+                                full_value: if token_type == "csrf" { Some(cookie.value.clone()) } else { None },
                                 location: "cookie".to_string(),
                                 first_seen_url: url.to_string(),
+                                first_seen_request_id: None,
+                                timestamp,
                             });
 
-                            if !findings.iter().any(|f| f.key_name.to_lowercase() == cookie_name.to_lowercase()) {
-                                findings.push(AuthFinding {
-                                    auth_type: "Session Cookie".to_string(),
-                                    location: "cookie".to_string(),
-                                    key_name: cookie_name.to_string(),
-                                    sample: "[SET-COOKIE]".to_string(),
-                                });
-                            }
+                            findings.push(AuthFinding {
+                                auth_type: format!("{} Cookie", if token_type == "session" { "Session" } else { "Auth" }),
+                                location: "cookie".to_string(),
+                                key_name: cookie.name.clone(),
+                                sample: format!("HttpOnly:{} Secure:{} SameSite:{:?}",
+                                    cookie.http_only, cookie.secure, cookie.same_site),
+                            });
                         }
                         break;
                     }
@@ -554,7 +909,7 @@ impl ReconEngine {
     }
 
     // ========================================================================
-    // API Detection
+    // Detection Methods
     // ========================================================================
 
     async fn detect_api(&self, url: &str, method: &str, headers: &HashMap<String, String>, request_id: Option<&str>) {
@@ -591,8 +946,7 @@ impl ReconEngine {
                 request_id: request_id.map(|s| s.to_string()),
             });
 
-            // Internal API check
-            let internal_patterns = ["/internal", "/private", "/admin", "/_", "/debug", "/config", "/hidden"];
+            let internal_patterns = ["/internal", "/private", "/admin", "/_", "/debug", "/config"];
             for pattern in &internal_patterns {
                 if url_lower.contains(pattern) {
                     println!("    -> INTERNAL API: contains '{}'", pattern);
@@ -607,21 +961,16 @@ impl ReconEngine {
         }
 
         if has_body {
-            // We'd need to get the actual body to parse the operation
-            // For now, just record that we found a GraphQL endpoint
             self.graphql_ops.lock().await.push(GraphQLOperation {
                 url: url.to_string(),
                 operation_type: "unknown".to_string(),
                 operation_name: None,
+                query: None,
                 variables: None,
                 request_id: request_id.to_string(),
             });
         }
     }
-
-    // ========================================================================
-    // Existing Detection Methods
-    // ========================================================================
 
     async fn detect_antibot_url(&self, url: &str) {
         let url_lower = url.to_lowercase();
@@ -633,7 +982,6 @@ impl ReconEngine {
             ("turnstile", "Cloudflare Turnstile"),
             ("datadome", "DataDome"),
             ("perimeterx", "PerimeterX"),
-            ("px-cdn", "PerimeterX CDN"),
             ("kasada", "Kasada"),
             ("fingerprintjs", "FingerprintJS"),
         ];
@@ -652,37 +1000,25 @@ impl ReconEngine {
     async fn detect_antibot_response(&self, headers: &HashMap<String, String>) {
         let mut findings = self.antibot_findings.lock().await;
 
-        // Cloudflare
         let has_cf = headers.contains_key("CF-Ray") || headers.contains_key("cf-ray")
             || headers.get("Server").or(headers.get("server")).map(|s| s.to_lowercase().contains("cloudflare")).unwrap_or(false);
 
         if has_cf && !findings.iter().any(|f| f.service == "Cloudflare") {
             println!("  [ANTIBOT] Cloudflare detected");
-            findings.push(AntiBotFinding {
-                service: "Cloudflare".to_string(),
-                indicator: "CF-Ray/Server header".to_string(),
-            });
+            findings.push(AntiBotFinding { service: "Cloudflare".to_string(), indicator: "CF-Ray header".to_string() });
         }
 
-        // Akamai
         if headers.contains_key("X-Akamai-Transformed") || headers.contains_key("x-akamai-transformed") {
             if !findings.iter().any(|f| f.service == "Akamai") {
                 println!("  [ANTIBOT] Akamai detected");
-                findings.push(AntiBotFinding {
-                    service: "Akamai".to_string(),
-                    indicator: "Akamai headers".to_string(),
-                });
+                findings.push(AntiBotFinding { service: "Akamai".to_string(), indicator: "Akamai headers".to_string() });
             }
         }
 
-        // DataDome
         if headers.contains_key("X-DataDome") || headers.contains_key("x-datadome") {
             if !findings.iter().any(|f| f.service == "DataDome") {
                 println!("  [ANTIBOT] DataDome detected");
-                findings.push(AntiBotFinding {
-                    service: "DataDome".to_string(),
-                    indicator: "X-DataDome header".to_string(),
-                });
+                findings.push(AntiBotFinding { service: "DataDome".to_string(), indicator: "X-DataDome header".to_string() });
             }
         }
     }
@@ -690,12 +1026,10 @@ impl ReconEngine {
     async fn check_interesting(&self, url: &str) {
         let url_lower = url.to_lowercase();
         let patterns = [
-            "/admin", "/api/internal", "/api/private", "/debug", "/config",
-            "/swagger", "/openapi", "/graphql", "/graphiql", "/.env",
-            "/backup", "/dump", "/export", "/download", "/upload",
-            "/login", "/signin", "/auth", "/oauth", "/token",
-            "/user", "/account", "/profile", "/settings", "/register",
-            "/signup", "/password", "/reset", "/forgot", "/mfa", "/2fa",
+            "/admin", "/api/internal", "/debug", "/config", "/swagger", "/openapi",
+            "/graphql", "/graphiql", "/.env", "/backup", "/dump", "/export",
+            "/login", "/signin", "/auth", "/oauth", "/token", "/user", "/account",
+            "/register", "/signup", "/password", "/reset", "/mfa", "/2fa",
         ];
 
         let mut interesting = self.interesting_urls.lock().await;
@@ -709,7 +1043,7 @@ impl ReconEngine {
 
     async fn check_sensitive_url(&self, url: &str) {
         let url_lower = url.to_lowercase();
-        let sensitive_params = ["api_key", "apikey", "key=", "secret", "password", "token=", "auth=", "credential"];
+        let sensitive_params = ["api_key", "apikey", "key=", "secret", "password", "token=", "credential"];
 
         for param in &sensitive_params {
             if url_lower.contains(param) {
@@ -734,7 +1068,6 @@ impl ReconEngine {
             ("strict-transport-security", "HSTS"),
             ("x-frame-options", "X-Frame-Options"),
             ("x-content-type-options", "X-Content-Type-Options"),
-            ("referrer-policy", "Referrer-Policy"),
         ];
 
         for (header, name) in &required {
@@ -753,32 +1086,22 @@ impl ReconEngine {
         let mut commands = Vec::new();
 
         for (_, req) in requests.iter() {
-            if is_static(&req.url) {
-                continue;
-            }
+            if is_static(&req.url) { continue; }
 
             let mut cmd = format!("curl -X {} '{}'", req.method, req.url);
 
             for (key, value) in &req.headers {
-                // Skip some headers that curl handles
                 let key_lower = key.to_lowercase();
-                if key_lower == "host" || key_lower == "content-length" || key_lower == "connection" {
-                    continue;
-                }
-                cmd.push_str(&format!(" \\\n  -H '{}: {}'", key, value.replace("'", "\\'")));
+                if key_lower == "host" || key_lower == "content-length" || key_lower == "connection" { continue; }
+                cmd.push_str(&format!(" \\\n  -H '{}: {}'", key, value.replace('\'', "\\'")));
             }
 
             if let Some(body) = &req.body {
-                if body != "[POST_DATA]" {
-                    cmd.push_str(&format!(" \\\n  -d '{}'", body.replace("'", "\\'")));
-                } else {
-                    cmd.push_str(" \\\n  -d '[REQUEST_BODY]'");
-                }
+                cmd.push_str(&format!(" \\\n  -d '{}'", body.replace('\'', "\\'")));
             }
 
             commands.push(cmd);
         }
-
         commands
     }
 
@@ -787,41 +1110,31 @@ impl ReconEngine {
         let mut scripts = Vec::new();
 
         for (_, req) in requests.iter() {
-            if is_static(&req.url) {
-                continue;
-            }
+            if is_static(&req.url) { continue; }
 
             let mut script = String::from("import requests\n\n");
-
-            // Headers
             script.push_str("headers = {\n");
             for (key, value) in &req.headers {
                 let key_lower = key.to_lowercase();
-                if key_lower == "host" || key_lower == "content-length" {
-                    continue;
-                }
-                script.push_str(&format!("    '{}': '{}',\n", key, value.replace("'", "\\'")));
+                if key_lower == "host" || key_lower == "content-length" { continue; }
+                script.push_str(&format!("    '{}': '{}',\n", key, value.replace('\'', "\\'")));
             }
             script.push_str("}\n\n");
 
-            // Request
             let method_lower = req.method.to_lowercase();
-            if req.body.is_some() {
+            if let Some(body) = &req.body {
                 script.push_str(&format!(
-                    "response = requests.{}(\n    '{}',\n    headers=headers,\n    data='[REQUEST_BODY]'\n)\n",
-                    method_lower, req.url
+                    "response = requests.{}(\n    '{}',\n    headers=headers,\n    data={}\n)\n",
+                    method_lower, req.url,
+                    if body.starts_with('{') { format!("'''{}'''", body) } else { format!("'{}'", body) }
                 ));
             } else {
-                script.push_str(&format!(
-                    "response = requests.{}('{}', headers=headers)\n",
-                    method_lower, req.url
-                ));
+                script.push_str(&format!("response = requests.{}('{}', headers=headers)\n", method_lower, req.url));
             }
 
             script.push_str("print(response.status_code)\nprint(response.text)\n");
             scripts.push(script);
         }
-
         scripts
     }
 
@@ -830,18 +1143,12 @@ impl ReconEngine {
         let mut raw_reqs = Vec::new();
 
         for (_, req) in requests.iter() {
-            if is_static(&req.url) {
-                continue;
-            }
+            if is_static(&req.url) { continue; }
 
             let url_parsed = url::Url::parse(&req.url).ok();
             let path = url_parsed.as_ref().map(|u| {
                 let p = u.path();
-                if let Some(q) = u.query() {
-                    format!("{}?{}", p, q)
-                } else {
-                    p.to_string()
-                }
+                if let Some(q) = u.query() { format!("{}?{}", p, q) } else { p.to_string() }
             }).unwrap_or("/".to_string());
 
             let host = url_parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("unknown");
@@ -850,22 +1157,15 @@ impl ReconEngine {
             raw.push_str(&format!("Host: {}\r\n", host));
 
             for (key, value) in &req.headers {
-                let key_lower = key.to_lowercase();
-                if key_lower == "host" {
-                    continue;
-                }
+                if key.to_lowercase() == "host" { continue; }
                 raw.push_str(&format!("{}: {}\r\n", key, value));
             }
 
             raw.push_str("\r\n");
-
-            if let Some(body) = &req.body {
-                raw.push_str(body);
-            }
+            if let Some(body) = &req.body { raw.push_str(body); }
 
             raw_reqs.push(raw);
         }
-
         raw_reqs
     }
 
@@ -876,15 +1176,12 @@ impl ReconEngine {
     async fn generate_report(&self, target: &str) -> ReconReport {
         let requests = self.requests.lock().await;
         let responses = self.responses.lock().await;
+        let websockets = self.websockets.lock().await;
 
-        // Build request-response pairs
         let mut pairs = Vec::new();
         for (id, req) in requests.iter() {
-            let resp = responses.iter().find(|r| r.request_id == *id).cloned();
-            pairs.push(RequestResponsePair {
-                request: req.clone(),
-                response: resp,
-            });
+            let resp = responses.get(id).cloned();
+            pairs.push(RequestResponsePair { request: req.clone(), response: resp });
         }
 
         ReconReport {
@@ -892,11 +1189,12 @@ impl ReconEngine {
             scan_time: chrono::Utc::now().to_rfc3339(),
             total_requests: *self.request_count.lock().await,
             captured_requests: requests.values().cloned().collect(),
-            captured_responses: responses.clone(),
+            captured_responses: responses.values().cloned().collect(),
             request_response_pairs: pairs,
+            websocket_connections: websockets.values().cloned().collect(),
             login_forms: self.login_forms.lock().await.clone(),
             registration_forms: self.registration_forms.lock().await.clone(),
-            auth_flows: Vec::new(), // TODO: implement flow tracking
+            auth_flows: self.auth_flows.lock().await.clone(),
             captured_tokens: self.captured_tokens.lock().await.clone(),
             api_endpoints: self.apis.lock().await.clone(),
             graphql_operations: self.graphql_ops.lock().await.clone(),
@@ -911,22 +1209,14 @@ impl ReconEngine {
         }
     }
 
-    // ========================================================================
-    // Login Form Analysis (called from JS)
-    // ========================================================================
-
     async fn add_login_form(&self, form: LoginForm) {
-        println!("  [LOGIN-FORM] Found: {} -> {}", form.url, form.action);
-        if form.has_csrf {
-            println!("    -> CSRF field: {:?}", form.csrf_field);
-        }
-        println!("    -> Fields: {:?}", form.fields.iter().map(|f| &f.name).collect::<Vec<_>>());
+        println!("  [LOGIN-FORM] {} -> {}", form.url, form.action);
+        if form.has_csrf { println!("    -> CSRF: {:?}", form.csrf_field); }
         self.login_forms.lock().await.push(form);
     }
 
     async fn add_registration_form(&self, form: RegistrationForm) {
-        println!("  [REGISTER-FORM] Found: {} -> {}", form.url, form.action);
-        println!("    -> Fields: {:?}", form.fields.iter().map(|f| &f.name).collect::<Vec<_>>());
+        println!("  [REGISTER-FORM] {} -> {}", form.url, form.action);
         self.registration_forms.lock().await.push(form);
     }
 }
@@ -941,20 +1231,24 @@ fn is_static(url: &str) -> bool {
     exts.iter().any(|ext| url_lower.contains(ext))
 }
 
+fn should_capture_body(mime_type: &str) -> bool {
+    let mime_lower = mime_type.to_lowercase();
+    mime_lower.contains("json") || mime_lower.contains("xml") || mime_lower.contains("text/html")
+        || mime_lower.contains("text/plain") || mime_lower.contains("javascript")
+        || mime_lower.contains("graphql")
+}
+
 fn is_jwt(token: &str) -> bool {
     token.split('.').count() == 3 && token.len() > 50
 }
 
 fn redact(value: &str) -> String {
-    if value.len() <= 10 {
-        "[REDACTED]".to_string()
-    } else {
-        format!("{}...{}", &value[..4], &value[value.len()-4..])
-    }
+    if value.len() <= 10 { "[REDACTED]".to_string() }
+    else { format!("{}...{}", &value[..4], &value[value.len()-4..]) }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max-3]) }
+    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max.saturating_sub(3)]) }
 }
 
 fn parse_cookies(cookie_header: Option<&String>) -> Vec<Cookie> {
@@ -965,131 +1259,110 @@ fn parse_cookies(cookie_header: Option<&String>) -> Vec<Cookie> {
                 Some(Cookie {
                     name: parts.next()?.to_string(),
                     value: parts.next().unwrap_or("").to_string(),
-                    domain: None,
-                    path: None,
+                    domain: None, path: None, expires: None,
+                    http_only: false, secure: false, same_site: None,
                 })
             })
             .collect()
     }).unwrap_or_default()
 }
 
+fn parse_set_cookie(value: &str) -> Cookie {
+    let parts: Vec<&str> = value.split(';').collect();
+    let mut cookie = Cookie {
+        name: String::new(), value: String::new(),
+        domain: None, path: None, expires: None,
+        http_only: false, secure: false, same_site: None,
+    };
+
+    if let Some(first) = parts.first() {
+        let mut kv = first.splitn(2, '=');
+        cookie.name = kv.next().unwrap_or("").trim().to_string();
+        cookie.value = kv.next().unwrap_or("").trim().to_string();
+    }
+
+    for part in parts.iter().skip(1) {
+        let part_lower = part.to_lowercase();
+        let part_trimmed = part.trim();
+
+        if part_lower.contains("httponly") {
+            cookie.http_only = true;
+        } else if part_lower.trim() == "secure" {
+            cookie.secure = true;
+        } else if part_lower.contains("domain=") {
+            cookie.domain = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
+        } else if part_lower.contains("path=") {
+            cookie.path = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
+        } else if part_lower.contains("expires=") {
+            cookie.expires = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
+        } else if part_lower.contains("samesite=") {
+            cookie.same_site = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
+        }
+    }
+    cookie
+}
+
 // ============================================================================
-// Enhanced JavaScript for Form Discovery
+// JavaScript
 // ============================================================================
 
 const RECON_JS: &str = r#"
 (function() {
     window.__recon = {
-        // Detect all forms with detailed field analysis
         analyzeForms: function() {
             return Array.from(document.forms).map(f => {
                 const fields = Array.from(f.elements).filter(e => e.name || e.id).map(e => ({
-                    name: e.name || '',
-                    type: e.type || 'text',
-                    id: e.id || null,
-                    placeholder: e.placeholder || null,
-                    required: e.required || false,
-                    pattern: e.pattern || null,
-                    autocomplete: e.autocomplete || null,
+                    name: e.name || '', type: e.type || 'text', id: e.id || null,
+                    placeholder: e.placeholder || null, required: e.required || false,
+                    pattern: e.pattern || null, autocomplete: e.autocomplete || null,
                     value: e.type === 'hidden' ? e.value : null
                 }));
-
                 const hasPassword = fields.some(f => f.type === 'password');
-                const hasUsername = fields.some(f =>
-                    f.name.toLowerCase().includes('user') ||
-                    f.name.toLowerCase().includes('login') ||
-                    f.autocomplete === 'username'
-                );
-                const hasEmail = fields.some(f =>
-                    f.type === 'email' ||
-                    f.name.toLowerCase().includes('email') ||
-                    f.autocomplete === 'email'
-                );
-                const csrfField = fields.find(f =>
-                    f.name.toLowerCase().includes('csrf') ||
-                    f.name.toLowerCase().includes('token') ||
-                    f.name === '_token'
-                );
-
+                const hasUsername = fields.some(f => f.name.toLowerCase().includes('user') || f.autocomplete === 'username');
+                const hasEmail = fields.some(f => f.type === 'email' || f.name.toLowerCase().includes('email'));
+                const csrfField = fields.find(f => f.name.toLowerCase().includes('csrf') || f.name.toLowerCase().includes('token') || f.name === '_token');
                 return {
-                    url: window.location.href,
-                    action: f.action || window.location.href,
-                    method: (f.method || 'GET').toUpperCase(),
-                    fields: fields,
-                    hasPassword: hasPassword,
-                    hasUsername: hasUsername,
-                    hasEmail: hasEmail,
-                    hasCsrf: !!csrfField,
+                    url: window.location.href, action: f.action || window.location.href,
+                    method: (f.method || 'GET').toUpperCase(), fields: fields,
+                    hasPassword, hasUsername, hasEmail, hasCsrf: !!csrfField,
                     csrfField: csrfField ? csrfField.name : null,
-                    csrfValue: csrfField ? csrfField.value : null,
                     isLoginForm: hasPassword && (hasUsername || hasEmail) && fields.length < 10,
                     isRegisterForm: hasPassword && hasEmail && fields.length >= 3
                 };
             });
         },
-
-        // Find login forms specifically
-        findLoginForms: function() {
-            return this.analyzeForms().filter(f => f.isLoginForm);
-        },
-
-        // Find registration forms
-        findRegisterForms: function() {
-            return this.analyzeForms().filter(f => f.isRegisterForm);
-        },
-
-        // Detect antibot scripts
+        findLoginForms: function() { return this.analyzeForms().filter(f => f.isLoginForm); },
+        findRegisterForms: function() { return this.analyzeForms().filter(f => f.isRegisterForm); },
         detectAntibot: function() {
             const scripts = Array.from(document.querySelectorAll('script[src]'));
-            const patterns = ['captcha', 'recaptcha', 'hcaptcha', 'turnstile', 'datadome', 'perimeterx', 'kasada', 'fingerprint', 'botd'];
+            const patterns = ['captcha', 'recaptcha', 'hcaptcha', 'turnstile', 'datadome', 'perimeterx', 'fingerprint'];
             return scripts.map(s => s.src).filter(src => patterns.some(p => src.toLowerCase().includes(p)));
         },
-
-        // Get all storage
         getStorage: function() {
             const result = { localStorage: {}, sessionStorage: {} };
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                result.localStorage[key] = localStorage.getItem(key).substring(0, 100);
-            }
-            for (let i = 0; i < sessionStorage.length; i++) {
-                const key = sessionStorage.key(i);
-                result.sessionStorage[key] = sessionStorage.getItem(key).substring(0, 100);
-            }
+            try {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    result.localStorage[key] = localStorage.getItem(key).substring(0, 100);
+                }
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    result.sessionStorage[key] = sessionStorage.getItem(key).substring(0, 100);
+                }
+            } catch(e) {}
             return result;
         },
-
-        // Find auth patterns in page
         findAuthPatterns: function() {
             const html = document.documentElement.innerHTML.toLowerCase();
             const patterns = [];
-            if (html.includes('csrf') || html.includes('_token')) patterns.push('CSRF token');
-            if (html.includes('jwt')) patterns.push('JWT reference');
+            if (html.includes('csrf') || html.includes('_token')) patterns.push('CSRF');
+            if (html.includes('jwt')) patterns.push('JWT');
             if (html.includes('oauth')) patterns.push('OAuth');
-            if (html.includes('bearer')) patterns.push('Bearer token');
-            if (html.includes('two-factor') || html.includes('2fa') || html.includes('mfa')) patterns.push('MFA/2FA');
-            if (html.includes('password') && html.includes('confirm')) patterns.push('Password confirmation');
+            if (html.includes('2fa') || html.includes('mfa')) patterns.push('MFA');
             return patterns;
-        },
-
-        // Intercept form submissions
-        interceptForms: function() {
-            document.querySelectorAll('form').forEach(form => {
-                form.addEventListener('submit', function(e) {
-                    const data = new FormData(form);
-                    const params = {};
-                    for (let [key, value] of data.entries()) {
-                        params[key] = value;
-                    }
-                    console.log('[RECON-FORM-SUBMIT]', form.action, params);
-                });
-            });
         }
     };
-
-    // Auto-intercept
-    window.__recon.interceptForms();
-    console.log('[RECON] Enhanced instrumentation loaded');
+    console.log('[RECON] v3 loaded');
 })();
 "#;
 
@@ -1099,28 +1372,21 @@ const RECON_JS: &str = r#"
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .init();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
 
     let args: Vec<String> = std::env::args().collect();
     let target = args.get(1).map(|s| s.as_str()).unwrap_or("https://example.com");
     let export_format = args.get(2).map(|s| s.as_str()).unwrap_or("all");
 
-    println!();
-    println!("{}", "═".repeat(70));
-    println!(" WEB RECON TOOL v2 - Bug Bounty Edition");
+    println!("\n{}", "═".repeat(70));
+    println!(" WEB RECON TOOL v3 - Bug Bounty Edition");
     println!(" Target: {}", target);
-    println!(" Export: {}", export_format);
     println!("{}", "═".repeat(70));
     println!();
 
     let engine = Arc::new(ReconEngine::new());
-    let engine_req = Arc::clone(&engine);
-    let engine_resp = Arc::clone(&engine);
 
-    // Launch browser
-    println!("[*] Launching browser with stealth mode...");
+    println!("[*] Launching browser...");
     let config = BrowserConfig::builder()
         .with_head()
         .no_sandbox()
@@ -1129,7 +1395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let (browser, mut handler) = Browser::launch(config).await?;
-    let handle = tokio::spawn(async move { while let Some(_) = handler.next().await {} });
+    let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let page = browser.new_page("about:blank").await?;
     page.enable_stealth_mode().await?;
@@ -1137,18 +1403,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Event listeners
     let mut req_events = page.event_listener::<EventRequestWillBeSent>().await?;
     let mut resp_events = page.event_listener::<EventResponseReceived>().await?;
+    let mut ws_created = page.event_listener::<EventWebSocketCreated>().await?;
+    let mut ws_sent = page.event_listener::<EventWebSocketFrameSent>().await?;
+    let mut ws_recv = page.event_listener::<EventWebSocketFrameReceived>().await?;
+    let mut ws_closed = page.event_listener::<EventWebSocketClosed>().await?;
 
+    // Spawn handlers
+    let engine_req = Arc::clone(&engine);
     let req_handle = tokio::spawn(async move {
         while let Some(event) = req_events.next().await {
             engine_req.capture_request(&event).await;
         }
     });
 
+    let engine_resp = Arc::clone(&engine);
     let resp_handle = tokio::spawn(async move {
         while let Some(event) = resp_events.next().await {
             engine_resp.capture_response(&event).await;
         }
     });
+
+    let engine_ws1 = Arc::clone(&engine);
+    tokio::spawn(async move { while let Some(e) = ws_created.next().await { engine_ws1.handle_websocket_created(&e).await; } });
+
+    let engine_ws2 = Arc::clone(&engine);
+    tokio::spawn(async move { while let Some(e) = ws_sent.next().await { engine_ws2.handle_websocket_frame_sent(&e).await; } });
+
+    let engine_ws3 = Arc::clone(&engine);
+    tokio::spawn(async move { while let Some(e) = ws_recv.next().await { engine_ws3.handle_websocket_frame_received(&e).await; } });
+
+    let engine_ws4 = Arc::clone(&engine);
+    tokio::spawn(async move { while let Some(e) = ws_closed.next().await { engine_ws4.handle_websocket_closed(&e).await; } });
 
     // Inject JS
     page.evaluate_on_new_document(RECON_JS).await?;
@@ -1159,16 +1444,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     // Scroll
-    println!("[*] Triggering lazy-loaded content...");
+    println!("[*] Scrolling page...");
     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)").await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)").await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-    // Client-side analysis
-    println!("\n[*] Analyzing forms and auth patterns...");
+    // Fetch bodies
+    println!("\n[*] Fetching request/response bodies...");
+    engine.fetch_pending_bodies(&page).await;
 
-    // Login forms
+    // Client analysis
+    println!("\n[*] Client-side analysis...");
     let login_forms: Vec<serde_json::Value> = page.evaluate("window.__recon.findLoginForms()").await?.into_value().unwrap_or_default();
     for form_json in &login_forms {
         if let Ok(form) = serde_json::from_value::<LoginForm>(form_json.clone()) {
@@ -1176,7 +1463,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Registration forms
     let reg_forms: Vec<serde_json::Value> = page.evaluate("window.__recon.findRegisterForms()").await?.into_value().unwrap_or_default();
     for form_json in &reg_forms {
         if let Ok(form) = serde_json::from_value::<RegistrationForm>(form_json.clone()) {
@@ -1184,25 +1470,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Antibot scripts
     let antibot: Vec<String> = page.evaluate("window.__recon.detectAntibot()").await?.into_value().unwrap_or_default();
     if !antibot.is_empty() {
-        println!("  [ANTIBOT] Client scripts:");
-        for s in &antibot { println!("    - {}", truncate(s, 60)); }
+        println!("  [ANTIBOT] Client scripts: {:?}", antibot);
     }
 
-    // Storage
     let storage: serde_json::Value = page.evaluate("window.__recon.getStorage()").await?.into_value().unwrap_or_default();
     println!("  [STORAGE] localStorage: {:?}", storage.get("localStorage").and_then(|v| v.as_object()).map(|o| o.keys().collect::<Vec<_>>()));
-    println!("  [STORAGE] sessionStorage: {:?}", storage.get("sessionStorage").and_then(|v| v.as_object()).map(|o| o.keys().collect::<Vec<_>>()));
 
-    // Auth patterns
-    let auth_patterns: Vec<String> = page.evaluate("window.__recon.findAuthPatterns()").await?.into_value().unwrap_or_default();
-    if !auth_patterns.is_empty() {
-        println!("  [AUTH-PATTERNS] Found: {:?}", auth_patterns);
-    }
-
-    // Generate report
+    // Report
     println!("\n{}", "═".repeat(70));
     println!(" RECON REPORT");
     println!("{}", "═".repeat(70));
@@ -1211,71 +1487,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nTotal Requests: {}", report.total_requests);
     println!("API Endpoints: {}", report.api_endpoints.len());
+    println!("WebSocket Connections: {}", report.websocket_connections.len());
     println!("Tokens Captured: {}", report.captured_tokens.len());
-    println!("Login Forms: {}", report.login_forms.len());
-    println!("Registration Forms: {}", report.registration_forms.len());
+    println!("Auth Flows: {}", report.auth_flows.len());
+    println!("Requests with Bodies: {}", report.captured_requests.iter().filter(|r| r.body.is_some()).count());
+    println!("Responses with Bodies: {}", report.captured_responses.iter().filter(|r| r.body.is_some()).count());
 
-    // Print APIs
     println!("\n--- API Endpoints ({}) ---", report.api_endpoints.len());
-    for api in &report.api_endpoints {
-        println!("  {} {} {}", api.method, api.api_type, truncate(&api.url, 60));
-    }
+    for api in &report.api_endpoints { println!("  {} {} {}", api.method, api.api_type, truncate(&api.url, 50)); }
 
-    // Print tokens
+    println!("\n--- WebSocket ({}) ---", report.websocket_connections.len());
+    for ws in &report.websocket_connections { println!("  {} - {} messages", truncate(&ws.url, 40), ws.messages.len()); }
+
     println!("\n--- Captured Tokens ({}) ---", report.captured_tokens.len());
-    for token in &report.captured_tokens {
-        println!("  [{}] {} @ {} = {}", token.token_type, token.name, token.location, token.value_preview);
-    }
+    for token in &report.captured_tokens { println!("  [{}] {} @ {}", token.token_type, token.name, token.location); }
 
-    // Print login forms
-    println!("\n--- Login Forms ({}) ---", report.login_forms.len());
-    for form in &report.login_forms {
-        println!("  {} -> {}", form.url, form.action);
-        println!("    CSRF: {} | Fields: {:?}", form.has_csrf, form.fields.iter().map(|f| &f.name).collect::<Vec<_>>());
-    }
+    println!("\n--- Auth Flows ({}) ---", report.auth_flows.len());
+    for flow in &report.auth_flows { println!("  {} - {} steps", flow.flow_type, flow.steps.len()); }
 
-    // Security
-    println!("\n--- Security Issues ({}) ---", report.security_findings.len());
-    for f in &report.security_findings { println!("  [!] {} - {}", f.finding_type, f.details); }
+    println!("\n--- Security ({}) ---", report.security_findings.len());
+    for f in &report.security_findings { println!("  [!] {}", f.finding_type); }
 
     println!("\n--- Missing Headers ---");
     for h in &report.missing_headers { println!("  [!] {}", h); }
 
-    // Save report
+    // Save
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-
-    // Main JSON report
-    let report_json = serde_json::to_string_pretty(&report)?;
     let json_file = format!("recon_{}.json", timestamp);
-    std::fs::write(&json_file, &report_json)?;
-    println!("\n[*] Report saved: {}", json_file);
+    std::fs::write(&json_file, serde_json::to_string_pretty(&report)?)?;
+    println!("\n[*] Report: {}", json_file);
 
-    // Export curl commands
     if export_format == "curl" || export_format == "all" {
         let curl_file = format!("recon_{}_curl.sh", timestamp);
-        let curl_content = report.curl_commands.join("\n\n# ---\n\n");
-        std::fs::write(&curl_file, format!("#!/bin/bash\n# Generated by recon.rs\n\n{}", curl_content))?;
-        println!("[*] Curl commands: {}", curl_file);
+        std::fs::write(&curl_file, format!("#!/bin/bash\n\n{}", report.curl_commands.join("\n\n")))?;
+        println!("[*] Curl: {}", curl_file);
     }
 
-    // Export Python
     if export_format == "python" || export_format == "all" {
         let py_file = format!("recon_{}_requests.py", timestamp);
-        let py_content = report.python_requests.join("\n# ---\n\n");
-        std::fs::write(&py_file, format!("# Generated by recon.rs\n\n{}", py_content))?;
-        println!("[*] Python requests: {}", py_file);
+        std::fs::write(&py_file, report.python_requests.join("\n\n"))?;
+        println!("[*] Python: {}", py_file);
     }
 
-    // Export raw HTTP
     if export_format == "raw" || export_format == "all" {
         let raw_file = format!("recon_{}_raw.txt", timestamp);
-        let raw_content = report.raw_http.join("\n\n---\n\n");
-        std::fs::write(&raw_file, &raw_content)?;
+        std::fs::write(&raw_file, report.raw_http.join("\n\n---\n\n"))?;
         println!("[*] Raw HTTP: {}", raw_file);
     }
 
     println!("\n{}", "═".repeat(70));
-    println!(" Scan Complete - {} requests captured", report.total_requests);
+    println!(" Complete - {} requests, {} with bodies", report.total_requests,
+        report.captured_requests.iter().filter(|r| r.body.is_some()).count());
     println!("{}", "═".repeat(70));
 
     drop(req_handle);
