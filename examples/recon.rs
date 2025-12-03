@@ -1,11 +1,18 @@
-//! # Web Recon Tool - Bug Bounty Edition v3
+//! # Web Recon Tool - Bug Bounty Edition v4
 //!
-//! Advanced security research tool for capturing traffic and generating raw requests.
-//! Features: Full body capture, WebSocket interception, auth flow tracking, multi-format export.
+//! Advanced security research tool with request interception, cookie dumping,
+//! XHR replay, secret scanning, and automatic security issue detection.
+//!
+//! ## TIER 1 Features (NEW):
+//! - Request interception via Fetch domain (modify/block requests)
+//! - Full cookie jar dump via Network.getCookies
+//! - XHR replay via Network.replayXHR
+//! - Secret scanning via Network.searchInResponseBody
+//! - Auto security issues via Audits.issueAdded
 //!
 //! ## Usage
 //! ```bash
-//! cargo run --example recon -- https://target.com [--export curl|python|raw|all]
+//! cargo run --example recon -- https://target.com [--intercept] [--export curl|python|raw|all]
 //! ```
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -13,7 +20,15 @@ use chromiumoxide::cdp::browser_protocol::network::{
     EventRequestWillBeSent, EventResponseReceived,
     EventWebSocketCreated, EventWebSocketFrameSent, EventWebSocketFrameReceived,
     EventWebSocketClosed, GetRequestPostDataParams, GetResponseBodyParams,
+    GetCookiesParams, ReplayXhrParams, SearchInResponseBodyParams,
     RequestId,
+};
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    EnableParams as FetchEnableParams, EventRequestPaused,
+    ContinueRequestParams, FailRequestParams, RequestPattern,
+};
+use chromiumoxide::cdp::browser_protocol::audits::{
+    EnableParams as AuditsEnableParams, EventIssueAdded,
 };
 use chromiumoxide::Page;
 use futures::StreamExt;
@@ -38,6 +53,7 @@ pub struct RawRequest {
     pub timestamp: u64,
     pub initiator: Option<String>,
     pub resource_type: String,
+    pub is_xhr: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +67,7 @@ pub struct RawResponse {
     pub body: Option<String>,
     pub body_size: Option<usize>,
     pub timestamp: u64,
+    pub secrets_found: Vec<SecretMatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +80,74 @@ pub struct Cookie {
     pub http_only: bool,
     pub secure: bool,
     pub same_site: Option<String>,
+    pub priority: Option<String>,
+    pub source_scheme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestResponsePair {
     pub request: RawRequest,
     pub response: Option<RawResponse>,
+}
+
+// ============================================================================
+// TIER 1: New Structures
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterceptedRequest {
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub resource_type: String,
+    pub action_taken: String, // "continued", "modified", "blocked"
+    pub modifications: Option<RequestModification>,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestModification {
+    pub url_changed: Option<String>,
+    pub method_changed: Option<String>,
+    pub headers_added: Vec<String>,
+    pub headers_removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretMatch {
+    pub pattern_name: String,
+    pub matched_value: String,
+    pub line_number: Option<i64>,
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityIssue {
+    pub issue_code: String,
+    pub severity: String,
+    pub description: String,
+    pub affected_url: Option<String>,
+    pub details: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CookieJar {
+    pub cookies: Vec<Cookie>,
+    pub captured_at: u64,
+    pub total_count: usize,
+    pub secure_count: usize,
+    pub http_only_count: usize,
+    pub session_cookies: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XhrReplayResult {
+    pub original_request_id: String,
+    pub replayed: bool,
+    pub error: Option<String>,
+    pub timestamp: u64,
 }
 
 // ============================================================================
@@ -87,7 +166,7 @@ pub struct WebSocketConnection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketMessage {
-    pub direction: String, // "sent" or "received"
+    pub direction: String,
     pub opcode: f64,
     pub payload: String,
     pub timestamp: u64,
@@ -157,7 +236,7 @@ pub struct CapturedToken {
     pub token_type: String,
     pub name: String,
     pub value_preview: String,
-    pub full_value: Option<String>, // For CSRF tokens that need to be replayed
+    pub full_value: Option<String>,
     pub location: String,
     pub first_seen_url: String,
     pub first_seen_request_id: Option<String>,
@@ -192,9 +271,13 @@ pub struct AntiBotFinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityFinding {
-    pub finding_type: String,
-    pub details: String,
+pub struct GraphQLOperation {
+    pub url: String,
+    pub operation_type: String,
+    pub operation_name: Option<String>,
+    pub query: Option<String>,
+    pub variables: Option<serde_json::Value>,
+    pub request_id: String,
 }
 
 // ============================================================================
@@ -212,6 +295,13 @@ pub struct ReconReport {
     pub captured_responses: Vec<RawResponse>,
     pub request_response_pairs: Vec<RequestResponsePair>,
 
+    // TIER 1: New data
+    pub intercepted_requests: Vec<InterceptedRequest>,
+    pub cookie_jar: Option<CookieJar>,
+    pub xhr_replays: Vec<XhrReplayResult>,
+    pub secrets_found: Vec<SecretMatch>,
+    pub security_issues: Vec<SecurityIssue>,
+
     // WebSocket
     pub websocket_connections: Vec<WebSocketConnection>,
 
@@ -228,7 +318,6 @@ pub struct ReconReport {
     // Security
     pub auth_findings: Vec<AuthFinding>,
     pub antibot_findings: Vec<AntiBotFinding>,
-    pub security_findings: Vec<SecurityFinding>,
     pub missing_headers: Vec<String>,
 
     // Interesting
@@ -238,16 +327,6 @@ pub struct ReconReport {
     pub curl_commands: Vec<String>,
     pub python_requests: Vec<String>,
     pub raw_http: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphQLOperation {
-    pub url: String,
-    pub operation_type: String,
-    pub operation_name: Option<String>,
-    pub query: Option<String>,
-    pub variables: Option<serde_json::Value>,
-    pub request_id: String,
 }
 
 // ============================================================================
@@ -270,9 +349,37 @@ struct PendingResponse {
 }
 
 // ============================================================================
+// Secret Patterns for Scanning
+// ============================================================================
+
+const SECRET_PATTERNS: &[(&str, &str)] = &[
+    ("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
+    ("AWS Secret Key", r#"(?i)aws(.{0,20})?['"][0-9a-zA-Z/+]{40}['"]"#),
+    ("GitHub Token", r"ghp_[0-9a-zA-Z]{36}"),
+    ("GitHub OAuth", r"gho_[0-9a-zA-Z]{36}"),
+    ("Slack Token", r"xox[baprs]-[0-9a-zA-Z]{10,48}"),
+    ("Slack Webhook", r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+"),
+    ("Google API Key", r"AIza[0-9A-Za-z\-_]{35}"),
+    ("Stripe Key", r"sk_live_[0-9a-zA-Z]{24}"),
+    ("Stripe Publishable", r"pk_live_[0-9a-zA-Z]{24}"),
+    ("Private Key", r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+    ("JWT Token", r"eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*"),
+    ("Bearer Token", r"[Bb]earer\s+[a-zA-Z0-9_\-\.]+"),
+    ("Basic Auth", r"[Bb]asic\s+[a-zA-Z0-9+/=]{20,}"),
+    ("API Key Generic", r#"(?i)(api[_-]?key|apikey)['"]?\s*[:=]\s*['"]?[a-zA-Z0-9_\-]{16,}"#),
+    ("Password Field", r#"(?i)(password|passwd|pwd)['"]?\s*[:=]\s*['"][^'"]{4,}['"]"#),
+    ("Secret Generic", r#"(?i)(secret|token)['"]?\s*[:=]\s*['"][a-zA-Z0-9_\-]{16,}['"]"#),
+    ("Firebase URL", r"https://[a-z0-9-]+\.firebaseio\.com"),
+    ("Twilio Key", r"SK[a-f0-9]{32}"),
+    ("SendGrid Key", r"SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}"),
+    ("Mailgun Key", r"key-[0-9a-zA-Z]{32}"),
+];
+
+// ============================================================================
 // Recon Engine
 // ============================================================================
 
+#[allow(dead_code)]
 struct ReconEngine {
     // Raw capture
     requests: Mutex<HashMap<String, RawRequest>>,
@@ -281,6 +388,14 @@ struct ReconEngine {
     // Pending body fetches
     pending_request_bodies: Mutex<Vec<PendingRequest>>,
     pending_response_bodies: Mutex<Vec<PendingResponse>>,
+
+    // TIER 1: New captures
+    intercepted_requests: Mutex<Vec<InterceptedRequest>>,
+    security_issues: Mutex<Vec<SecurityIssue>>,
+    secrets_found: Mutex<Vec<SecretMatch>>,
+    xhr_requests: Mutex<Vec<String>>, // Request IDs of XHR requests
+    xhr_replays: Mutex<Vec<XhrReplayResult>>,
+    intercept_mode: bool,
 
     // WebSocket connections
     websockets: Mutex<HashMap<String, WebSocketConnection>>,
@@ -302,7 +417,6 @@ struct ReconEngine {
 
     // Security
     antibot_findings: Mutex<Vec<AntiBotFinding>>,
-    security_findings: Mutex<Vec<SecurityFinding>>,
     interesting_urls: Mutex<Vec<String>>,
 
     // Headers
@@ -312,12 +426,18 @@ struct ReconEngine {
 }
 
 impl ReconEngine {
-    fn new() -> Self {
+    fn new(intercept_mode: bool) -> Self {
         Self {
             requests: Mutex::new(HashMap::new()),
             responses: Mutex::new(HashMap::new()),
             pending_request_bodies: Mutex::new(Vec::new()),
             pending_response_bodies: Mutex::new(Vec::new()),
+            intercepted_requests: Mutex::new(Vec::new()),
+            security_issues: Mutex::new(Vec::new()),
+            secrets_found: Mutex::new(Vec::new()),
+            xhr_requests: Mutex::new(Vec::new()),
+            xhr_replays: Mutex::new(Vec::new()),
+            intercept_mode,
             websockets: Mutex::new(HashMap::new()),
             seen_urls: Mutex::new(HashSet::new()),
             apis: Mutex::new(Vec::new()),
@@ -329,12 +449,278 @@ impl ReconEngine {
             auth_flows: Mutex::new(Vec::new()),
             current_auth_flow: Mutex::new(None),
             antibot_findings: Mutex::new(Vec::new()),
-            security_findings: Mutex::new(Vec::new()),
             interesting_urls: Mutex::new(Vec::new()),
             request_count: Mutex::new(0),
             checked_headers: Mutex::new(false),
             header_findings: Mutex::new(Vec::new()),
         }
+    }
+
+    // ========================================================================
+    // TIER 1: Request Interception (Fetch Domain)
+    // ========================================================================
+
+    async fn handle_intercepted_request(&self, event: &EventRequestPaused) -> InterceptedRequest {
+        let request_id = event.request_id.inner().to_string();
+        let url = event.request.url.clone();
+        let method = event.request.method.clone();
+        let resource_type = format!("{:?}", event.resource_type);
+
+        let headers: HashMap<String, String> = event
+            .request
+            .headers
+            .inner()
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        println!("  [INTERCEPT] {} {} {}", method, truncate(&url, 50), resource_type);
+
+        // Analyze for blocking decision
+        let should_block = self.should_block_request(&url, &headers).await;
+
+        let action = if should_block {
+            "blocked".to_string()
+        } else {
+            "continued".to_string()
+        };
+
+        let intercepted = InterceptedRequest {
+            request_id: request_id.clone(),
+            url: url.clone(),
+            method,
+            headers,
+            resource_type,
+            action_taken: action.clone(),
+            modifications: None,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        self.intercepted_requests.lock().await.push(intercepted.clone());
+        intercepted
+    }
+
+    async fn should_block_request(&self, url: &str, _headers: &HashMap<String, String>) -> bool {
+        let url_lower = url.to_lowercase();
+
+        // Block known tracking/analytics
+        let block_patterns = [
+            "google-analytics.com",
+            "googletagmanager.com",
+            "facebook.com/tr",
+            "doubleclick.net",
+            "adsense",
+            "adserver",
+            "tracking",
+            "analytics",
+            "telemetry",
+        ];
+
+        for pattern in &block_patterns {
+            if url_lower.contains(pattern) {
+                println!("    -> BLOCKED: matches '{}'", pattern);
+                return true;
+            }
+        }
+        false
+    }
+
+    // ========================================================================
+    // TIER 1: Cookie Jar Dump
+    // ========================================================================
+
+    async fn dump_cookie_jar(&self, page: &Page) -> Option<CookieJar> {
+        println!("[*] Dumping full cookie jar...");
+
+        let params = GetCookiesParams::default();
+        match page.execute(params).await {
+            Ok(result) => {
+                let cookies: Vec<Cookie> = result.cookies.iter().map(|c| {
+                    Cookie {
+                        name: c.name.clone(),
+                        value: c.value.clone(),
+                        domain: Some(c.domain.clone()),
+                        path: Some(c.path.clone()),
+                        expires: if c.expires < 0.0 { None } else { Some(format!("{}", c.expires)) },
+                        http_only: c.http_only,
+                        secure: c.secure,
+                        same_site: c.same_site.as_ref().map(|s| format!("{:?}", s)),
+                        priority: Some(format!("{:?}", c.priority)),
+                        source_scheme: Some(format!("{:?}", c.source_scheme)),
+                    }
+                }).collect();
+
+                let secure_count = cookies.iter().filter(|c| c.secure).count();
+                let http_only_count = cookies.iter().filter(|c| c.http_only).count();
+                let session_cookies = result.cookies.iter().filter(|c| c.session).count();
+
+                println!("  [COOKIES] Total: {}, Secure: {}, HttpOnly: {}, Session: {}",
+                    cookies.len(), secure_count, http_only_count, session_cookies);
+
+                // Print interesting cookies
+                for cookie in &cookies {
+                    let name_lower = cookie.name.to_lowercase();
+                    if name_lower.contains("session") || name_lower.contains("token") ||
+                       name_lower.contains("auth") || name_lower.contains("jwt") ||
+                       name_lower.contains("csrf") {
+                        println!("    -> {} = {}... (Secure:{}, HttpOnly:{})",
+                            cookie.name,
+                            truncate(&cookie.value, 20),
+                            cookie.secure,
+                            cookie.http_only);
+                    }
+                }
+
+                Some(CookieJar {
+                    total_count: cookies.len(),
+                    secure_count,
+                    http_only_count,
+                    session_cookies,
+                    cookies,
+                    captured_at: chrono::Utc::now().timestamp_millis() as u64,
+                })
+            }
+            Err(e) => {
+                println!("  [ERROR] Failed to dump cookies: {}", e);
+                None
+            }
+        }
+    }
+
+    // ========================================================================
+    // TIER 1: XHR Replay
+    // ========================================================================
+
+    async fn replay_xhr_requests(&self, page: &Page) {
+        let xhr_ids = self.xhr_requests.lock().await.clone();
+
+        if xhr_ids.is_empty() {
+            println!("[*] No XHR requests to replay");
+            return;
+        }
+
+        println!("[*] Replaying {} XHR requests...", xhr_ids.len());
+
+        for request_id in xhr_ids.iter().take(5) { // Limit to 5 replays
+            let params = ReplayXhrParams::new(RequestId::from(request_id.clone()));
+
+            let result = match page.execute(params).await {
+                Ok(_) => {
+                    println!("  [REPLAY] {} - Success", request_id);
+                    XhrReplayResult {
+                        original_request_id: request_id.clone(),
+                        replayed: true,
+                        error: None,
+                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                    }
+                }
+                Err(e) => {
+                    println!("  [REPLAY] {} - Failed: {}", request_id, e);
+                    XhrReplayResult {
+                        original_request_id: request_id.clone(),
+                        replayed: false,
+                        error: Some(e.to_string()),
+                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                    }
+                }
+            };
+
+            self.xhr_replays.lock().await.push(result);
+        }
+    }
+
+    // ========================================================================
+    // TIER 1: Secret Scanning in Response Bodies
+    // ========================================================================
+
+    async fn scan_response_for_secrets(&self, page: &Page, request_id: &str, url: &str) -> Vec<SecretMatch> {
+        let mut found_secrets = Vec::new();
+
+        // Use CDP searchInResponseBody for each pattern
+        for (pattern_name, pattern) in SECRET_PATTERNS {
+            let mut params = SearchInResponseBodyParams::new(
+                RequestId::from(request_id.to_string()),
+                pattern.to_string()
+            );
+            params.is_regex = Some(true);
+
+            if let Ok(response) = page.execute(params).await {
+                for search_match in &response.result.result {
+                    let secret = SecretMatch {
+                        pattern_name: pattern_name.to_string(),
+                        matched_value: truncate(&search_match.line_content, 100),
+                        line_number: Some(search_match.line_number as i64),
+                        context: Some(search_match.line_content.clone()),
+                    };
+
+                    println!("  [SECRET!] {} found in {} (line {})",
+                        pattern_name, truncate(url, 40), search_match.line_number as i64);
+
+                    found_secrets.push(secret);
+                }
+            }
+        }
+
+        if !found_secrets.is_empty() {
+            self.secrets_found.lock().await.extend(found_secrets.clone());
+        }
+
+        found_secrets
+    }
+
+    // ========================================================================
+    // TIER 1: Security Issue Handler (Audits Domain)
+    // ========================================================================
+
+    async fn handle_security_issue(&self, event: &EventIssueAdded) {
+        let code = format!("{:?}", event.issue.code);
+        let details = format!("{:?}", event.issue.details);
+
+        let severity = match &event.issue.code {
+            c if format!("{:?}", c).contains("Cookie") => "Medium",
+            c if format!("{:?}", c).contains("MixedContent") => "High",
+            c if format!("{:?}", c).contains("Cors") => "Medium",
+            c if format!("{:?}", c).contains("Csp") => "High",
+            c if format!("{:?}", c).contains("Deprecation") => "Low",
+            _ => "Info",
+        };
+
+        // Extract affected URL if available
+        let affected_url = if details.contains("url") {
+            // Try to extract URL from details
+            details.split("url").nth(1)
+                .and_then(|s| s.split('"').nth(1))
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        let description = match &code {
+            c if c.contains("SameSiteCookie") => "Cookie without SameSite attribute",
+            c if c.contains("MixedContent") => "Mixed content (HTTP resource on HTTPS page)",
+            c if c.contains("BlockedByResponse") => "Request blocked by response headers (CORS/COEP)",
+            c if c.contains("Cors") => "CORS policy violation",
+            c if c.contains("ContentSecurityPolicy") => "Content Security Policy violation",
+            c if c.contains("Deprecation") => "Deprecated API usage",
+            _ => "Security issue detected",
+        };
+
+        println!("  [SECURITY-ISSUE] [{}] {} - {}", severity, code, description);
+
+        let issue = SecurityIssue {
+            issue_code: code,
+            severity: severity.to_string(),
+            description: description.to_string(),
+            affected_url,
+            details,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        self.security_issues.lock().await.push(issue);
     }
 
     // ========================================================================
@@ -368,7 +754,15 @@ impl ReconEngine {
 
         let has_post_data = event.request.has_post_data.unwrap_or(false);
 
-        // Queue for body fetch if has POST data
+        // Check if XHR
+        let is_xhr = event.r#type.as_ref()
+            .map(|t| format!("{:?}", t).contains("XHR"))
+            .unwrap_or(false);
+
+        if is_xhr {
+            self.xhr_requests.lock().await.push(request_id.clone());
+        }
+
         if has_post_data {
             self.pending_request_bodies.lock().await.push(PendingRequest {
                 request_id: request_id.clone(),
@@ -382,11 +776,12 @@ impl ReconEngine {
             method: method.clone(),
             headers: headers.clone(),
             cookies,
-            body: None, // Will be filled later
+            body: None,
             content_type: content_type.clone(),
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             initiator: event.initiator.url.clone(),
             resource_type: event.r#type.as_ref().map(|t| format!("{:?}", t)).unwrap_or_default(),
+            is_xhr,
         };
 
         self.requests.lock().await.insert(request_id.clone(), raw_request);
@@ -424,7 +819,6 @@ impl ReconEngine {
 
         let mime_type = event.response.mime_type.clone();
 
-        // Queue for body fetch if it's a useful content type
         if should_capture_body(&mime_type) {
             self.pending_response_bodies.lock().await.push(PendingResponse {
                 request_id: request_id.clone(),
@@ -443,6 +837,7 @@ impl ReconEngine {
             body: None,
             body_size: None,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            secrets_found: Vec::new(),
         };
 
         self.responses.lock().await.insert(request_id.clone(), raw_response);
@@ -461,25 +856,33 @@ impl ReconEngine {
             println!("  [AUTH-REQUIRED] {} {} {}", status, event.response.status_text, truncate(url, 60));
         } else if status >= 500 {
             println!("  [SERVER-ERROR] {} {} - Potential info leak", status, truncate(url, 60));
-            self.security_findings.lock().await.push(SecurityFinding {
-                finding_type: "Server Error".to_string(),
-                details: format!("{} at {}", status, truncate(url, 100)),
+            self.security_issues.lock().await.push(SecurityIssue {
+                issue_code: "ServerError".to_string(),
+                severity: "Medium".to_string(),
+                description: format!("Server error {} at endpoint", status),
+                affected_url: Some(url.clone()),
+                details: format!("Status: {} {}", status, event.response.status_text),
+                timestamp: chrono::Utc::now().timestamp_millis() as u64,
             });
         }
 
         if let Some(cors) = headers.get("Access-Control-Allow-Origin").or(headers.get("access-control-allow-origin")) {
             if cors == "*" {
                 println!("  [CORS] Wildcard CORS: {}", truncate(url, 60));
-                self.security_findings.lock().await.push(SecurityFinding {
-                    finding_type: "Wildcard CORS".to_string(),
-                    details: format!("Access-Control-Allow-Origin: * at {}", truncate(url, 80)),
+                self.security_issues.lock().await.push(SecurityIssue {
+                    issue_code: "WildcardCORS".to_string(),
+                    severity: "Medium".to_string(),
+                    description: "Wildcard CORS allows any origin".to_string(),
+                    affected_url: Some(url.clone()),
+                    details: "Access-Control-Allow-Origin: *".to_string(),
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
                 });
             }
         }
     }
 
     // ========================================================================
-    // Body Fetching (called after page load)
+    // Body Fetching (with secret scanning)
     // ========================================================================
 
     async fn fetch_pending_bodies(&self, page: &Page) {
@@ -494,7 +897,6 @@ impl ReconEngine {
                 let mut requests = self.requests.lock().await;
                 if let Some(req) = requests.get_mut(&pending.request_id) {
                     if !body.is_empty() {
-                        // Check if it's GraphQL and parse
                         if req.url.to_lowercase().contains("graphql") {
                             self.parse_graphql_body(&body, &pending.request_id).await;
                         }
@@ -505,19 +907,21 @@ impl ReconEngine {
             }
         }
 
-        // Fetch response bodies
+        // Fetch response bodies with secret scanning
         let pending_resps = {
             let mut pending = self.pending_response_bodies.lock().await;
             std::mem::take(&mut *pending)
         };
 
         for pending in pending_resps {
+            // Scan for secrets first (uses CDP search which is more efficient)
+            let secrets = self.scan_response_for_secrets(page, &pending.request_id, &pending.url).await;
+
             if let Ok((body, _base64)) = self.fetch_response_body(page, &pending.request_id).await {
                 let mut responses = self.responses.lock().await;
                 if let Some(resp) = responses.get_mut(&pending.request_id) {
                     if !body.is_empty() {
                         let size = body.len();
-                        // Truncate large bodies for storage
                         let stored_body = if size > 50000 {
                             format!("{}... [TRUNCATED - {} bytes total]", &body[..50000], size)
                         } else {
@@ -526,6 +930,7 @@ impl ReconEngine {
                         println!("  [BODY] Response {} - {} bytes", truncate(&pending.url, 40), size);
                         resp.body = Some(stored_body);
                         resp.body_size = Some(size);
+                        resp.secrets_found = secrets;
                     }
                 }
             }
@@ -551,13 +956,9 @@ impl ReconEngine {
             let operation_name = json.get("operationName").and_then(|n| n.as_str()).map(|s| s.to_string());
 
             let operation_type = query.as_ref().map(|q| {
-                if q.trim().starts_with("mutation") {
-                    "mutation"
-                } else if q.trim().starts_with("subscription") {
-                    "subscription"
-                } else {
-                    "query"
-                }
+                if q.trim().starts_with("mutation") { "mutation" }
+                else if q.trim().starts_with("subscription") { "subscription" }
+                else { "query" }
             }).unwrap_or("unknown").to_string();
 
             let mut ops = self.graphql_ops.lock().await;
@@ -646,9 +1047,7 @@ impl ReconEngine {
             || url_lower.contains("/auth") || url_lower.contains("/oauth")
             || url_lower.contains("/token") || url_lower.contains("/session");
 
-        if !is_auth_endpoint {
-            return;
-        }
+        if !is_auth_endpoint { return; }
 
         let tokens_sent: Vec<String> = {
             let captured = self.captured_tokens.lock().await;
@@ -692,17 +1091,12 @@ impl ReconEngine {
 
     async fn track_auth_flow_response(&self, url: &str, headers: &HashMap<String, String>, request_id: &str, status: i64) {
         let mut current_flow = self.current_auth_flow.lock().await;
-        if current_flow.is_none() {
-            return;
-        }
+        if current_flow.is_none() { return; }
 
         let flow = current_flow.as_mut().unwrap();
 
-        // Check for tokens in response
         let tokens_received: Vec<String> = {
             let mut tokens = Vec::new();
-
-            // Check Set-Cookie for session tokens
             for (key, value) in headers.iter() {
                 if key.to_lowercase() == "set-cookie" {
                     let cookie_name = value.split('=').next().unwrap_or("");
@@ -711,16 +1105,12 @@ impl ReconEngine {
                     }
                 }
             }
-
-            // Check for auth headers
             if headers.contains_key("Authorization") || headers.contains_key("authorization") {
                 tokens.push("header:authorization".to_string());
             }
-
             tokens
         };
 
-        // Add response step
         let step = AuthFlowStep {
             step_number: flow.steps.len(),
             request_id: request_id.to_string(),
@@ -734,28 +1124,21 @@ impl ReconEngine {
 
         flow.steps.push(step);
 
-        // Check if flow is complete (successful auth or redirect)
         if (status == 200 || status == 302) && !tokens_received.is_empty() {
             flow.completed_at = Some(chrono::Utc::now().timestamp_millis() as u64);
-
-            // Copy captured tokens
             let captured = self.captured_tokens.lock().await;
             flow.tokens_captured = captured.clone();
-
-            // Store completed flow
             let completed_flow = flow.clone();
             drop(current_flow);
             self.auth_flows.lock().await.push(completed_flow);
             *self.current_auth_flow.lock().await = None;
-
-            println!("  [AUTH-FLOW] Completed - {} steps, {} tokens",
-                self.auth_flows.lock().await.last().map(|f| f.steps.len()).unwrap_or(0),
-                self.auth_flows.lock().await.last().map(|f| f.tokens_captured.len()).unwrap_or(0));
+            println!("  [AUTH-FLOW] Completed - {} steps",
+                self.auth_flows.lock().await.last().map(|f| f.steps.len()).unwrap_or(0));
         }
     }
 
     // ========================================================================
-    // Token Capture (Enhanced)
+    // Token Capture
     // ========================================================================
 
     async fn capture_auth_tokens(&self, url: &str, headers: &HashMap<String, String>, context: &str, request_id: Option<&str>) {
@@ -763,7 +1146,6 @@ impl ReconEngine {
         let mut findings = self.auth_findings.lock().await;
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
 
-        // Authorization header
         if let Some(auth) = headers.get("Authorization").or(headers.get("authorization")) {
             let (token_type, auth_type_str) = if auth.starts_with("Bearer ") {
                 let token = &auth[7..];
@@ -786,7 +1168,6 @@ impl ReconEngine {
                     first_seen_request_id: request_id.map(|s| s.to_string()),
                     timestamp,
                 });
-
                 if !findings.iter().any(|f| f.auth_type == auth_type_str) {
                     findings.push(AuthFinding {
                         auth_type: auth_type_str.to_string(),
@@ -798,12 +1179,7 @@ impl ReconEngine {
             }
         }
 
-        // API keys
-        let api_key_headers = [
-            "X-API-Key", "x-api-key", "Api-Key", "api-key",
-            "X-Auth-Token", "x-auth-token", "X-Access-Token", "x-access-token",
-        ];
-
+        let api_key_headers = ["X-API-Key", "x-api-key", "Api-Key", "api-key", "X-Auth-Token", "x-auth-token"];
         for key in &api_key_headers {
             if let Some(value) = headers.get(*key) {
                 let key_lower = key.to_lowercase();
@@ -829,7 +1205,6 @@ impl ReconEngine {
             }
         }
 
-        // CSRF tokens (capture full value for replay)
         let csrf_headers = ["X-CSRF-Token", "x-csrf-token", "X-XSRF-Token", "x-xsrf-token"];
         for key in &csrf_headers {
             if let Some(value) = headers.get(*key) {
@@ -839,7 +1214,7 @@ impl ReconEngine {
                         token_type: "csrf".to_string(),
                         name: key.to_string(),
                         value_preview: redact(value),
-                        full_value: Some(value.clone()), // Full value for replay
+                        full_value: Some(value.clone()),
                         location: "header".to_string(),
                         first_seen_url: url.to_string(),
                         first_seen_request_id: request_id.map(|s| s.to_string()),
@@ -864,20 +1239,15 @@ impl ReconEngine {
         for (key, value) in headers.iter() {
             if key.to_lowercase() == "set-cookie" {
                 let cookie = parse_set_cookie(value);
-
                 let session_patterns = ["session", "sess", "sid", "token", "auth", "jwt", "csrf", "xsrf"];
                 let name_lower = cookie.name.to_lowercase();
 
                 for pattern in &session_patterns {
                     if name_lower.contains(pattern) {
                         if !tokens.iter().any(|t| t.name.to_lowercase() == name_lower && t.location == "cookie") {
-                            let token_type = if name_lower.contains("csrf") || name_lower.contains("xsrf") {
-                                "csrf"
-                            } else if name_lower.contains("jwt") || is_jwt(&cookie.value) {
-                                "jwt"
-                            } else {
-                                "session"
-                            };
+                            let token_type = if name_lower.contains("csrf") || name_lower.contains("xsrf") { "csrf" }
+                            else if name_lower.contains("jwt") || is_jwt(&cookie.value) { "jwt" }
+                            else { "session" };
 
                             println!("  [TOKEN] Cookie set: {} ({}) HttpOnly:{} Secure:{}",
                                 cookie.name, token_type, cookie.http_only, cookie.secure);
@@ -897,8 +1267,7 @@ impl ReconEngine {
                                 auth_type: format!("{} Cookie", if token_type == "session" { "Session" } else { "Auth" }),
                                 location: "cookie".to_string(),
                                 key_name: cookie.name.clone(),
-                                sample: format!("HttpOnly:{} Secure:{} SameSite:{:?}",
-                                    cookie.http_only, cookie.secure, cookie.same_site),
+                                sample: format!("HttpOnly:{} Secure:{} SameSite:{:?}", cookie.http_only, cookie.secure, cookie.same_site),
                             });
                         }
                         break;
@@ -915,17 +1284,11 @@ impl ReconEngine {
     async fn detect_api(&self, url: &str, method: &str, headers: &HashMap<String, String>, request_id: Option<&str>) {
         let url_lower = url.to_lowercase();
 
-        let api_type = if url_lower.contains("graphql") || url_lower.contains("/gql") {
-            "GraphQL"
-        } else if url_lower.starts_with("wss://") || url_lower.starts_with("ws://") {
-            "WebSocket"
-        } else if url_lower.contains("/api/") || url_lower.contains("/v1/") || url_lower.contains("/v2/") || url_lower.contains("/v3/") {
-            "REST"
-        } else if headers.get("Content-Type").or(headers.get("content-type")).map(|ct| ct.contains("json")).unwrap_or(false) {
-            "JSON"
-        } else {
-            return;
-        };
+        let api_type = if url_lower.contains("graphql") || url_lower.contains("/gql") { "GraphQL" }
+        else if url_lower.starts_with("wss://") || url_lower.starts_with("ws://") { "WebSocket" }
+        else if url_lower.contains("/api/") || url_lower.contains("/v1/") || url_lower.contains("/v2/") || url_lower.contains("/v3/") { "REST" }
+        else if headers.get("Content-Type").or(headers.get("content-type")).map(|ct| ct.contains("json")).unwrap_or(false) { "JSON" }
+        else { return; };
 
         let has_auth = headers.contains_key("Authorization") || headers.contains_key("authorization")
             || headers.contains_key("X-API-Key") || headers.contains_key("x-api-key");
@@ -935,9 +1298,7 @@ impl ReconEngine {
         if !seen.contains(&api_key) {
             seen.insert(api_key);
             drop(seen);
-
             println!("  [API] {} {} {}", api_type, method, truncate(url, 60));
-
             self.apis.lock().await.push(ApiEndpoint {
                 url: url.to_string(),
                 method: method.to_string(),
@@ -956,10 +1317,7 @@ impl ReconEngine {
     }
 
     async fn detect_graphql(&self, url: &str, _headers: &HashMap<String, String>, has_body: bool, request_id: &str) {
-        if !url.to_lowercase().contains("graphql") && !url.to_lowercase().contains("/gql") {
-            return;
-        }
-
+        if !url.to_lowercase().contains("graphql") && !url.to_lowercase().contains("/gql") { return; }
         if has_body {
             self.graphql_ops.lock().await.push(GraphQLOperation {
                 url: url.to_string(),
@@ -975,46 +1333,32 @@ impl ReconEngine {
     async fn detect_antibot_url(&self, url: &str) {
         let url_lower = url.to_lowercase();
         let mut findings = self.antibot_findings.lock().await;
-
         let checks = [
-            ("recaptcha", "Google reCAPTCHA"),
-            ("hcaptcha", "hCaptcha"),
-            ("turnstile", "Cloudflare Turnstile"),
-            ("datadome", "DataDome"),
-            ("perimeterx", "PerimeterX"),
-            ("kasada", "Kasada"),
-            ("fingerprintjs", "FingerprintJS"),
+            ("recaptcha", "Google reCAPTCHA"), ("hcaptcha", "hCaptcha"), ("turnstile", "Cloudflare Turnstile"),
+            ("datadome", "DataDome"), ("perimeterx", "PerimeterX"), ("kasada", "Kasada"), ("fingerprintjs", "FingerprintJS"),
         ];
-
         for (pattern, service) in &checks {
             if url_lower.contains(pattern) && !findings.iter().any(|f| f.service == *service) {
                 println!("  [ANTIBOT] {} detected", service);
-                findings.push(AntiBotFinding {
-                    service: service.to_string(),
-                    indicator: format!("URL contains '{}'", pattern),
-                });
+                findings.push(AntiBotFinding { service: service.to_string(), indicator: format!("URL contains '{}'", pattern) });
             }
         }
     }
 
     async fn detect_antibot_response(&self, headers: &HashMap<String, String>) {
         let mut findings = self.antibot_findings.lock().await;
-
         let has_cf = headers.contains_key("CF-Ray") || headers.contains_key("cf-ray")
             || headers.get("Server").or(headers.get("server")).map(|s| s.to_lowercase().contains("cloudflare")).unwrap_or(false);
-
         if has_cf && !findings.iter().any(|f| f.service == "Cloudflare") {
             println!("  [ANTIBOT] Cloudflare detected");
             findings.push(AntiBotFinding { service: "Cloudflare".to_string(), indicator: "CF-Ray header".to_string() });
         }
-
         if headers.contains_key("X-Akamai-Transformed") || headers.contains_key("x-akamai-transformed") {
             if !findings.iter().any(|f| f.service == "Akamai") {
                 println!("  [ANTIBOT] Akamai detected");
                 findings.push(AntiBotFinding { service: "Akamai".to_string(), indicator: "Akamai headers".to_string() });
             }
         }
-
         if headers.contains_key("X-DataDome") || headers.contains_key("x-datadome") {
             if !findings.iter().any(|f| f.service == "DataDome") {
                 println!("  [ANTIBOT] DataDome detected");
@@ -1031,7 +1375,6 @@ impl ReconEngine {
             "/login", "/signin", "/auth", "/oauth", "/token", "/user", "/account",
             "/register", "/signup", "/password", "/reset", "/mfa", "/2fa",
         ];
-
         let mut interesting = self.interesting_urls.lock().await;
         for pattern in &patterns {
             if url_lower.contains(pattern) && !interesting.iter().any(|u| u == url) {
@@ -1044,13 +1387,16 @@ impl ReconEngine {
     async fn check_sensitive_url(&self, url: &str) {
         let url_lower = url.to_lowercase();
         let sensitive_params = ["api_key", "apikey", "key=", "secret", "password", "token=", "credential"];
-
         for param in &sensitive_params {
             if url_lower.contains(param) {
                 println!("  [SENSITIVE] Secret in URL: {}", truncate(url, 50));
-                self.security_findings.lock().await.push(SecurityFinding {
-                    finding_type: "Secret in URL".to_string(),
-                    details: format!("Parameter '{}' found", param),
+                self.security_issues.lock().await.push(SecurityIssue {
+                    issue_code: "SecretInURL".to_string(),
+                    severity: "High".to_string(),
+                    description: format!("Sensitive parameter '{}' found in URL", param),
+                    affected_url: Some(url.to_string()),
+                    details: format!("Parameter '{}' should not be in URL", param),
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
                 });
                 break;
             }
@@ -1059,17 +1405,13 @@ impl ReconEngine {
 
     async fn check_security_headers(&self, headers: &HashMap<String, String>) {
         let mut missing = self.header_findings.lock().await;
-        let headers_lower: HashMap<String, String> = headers.iter()
-            .map(|(k, v)| (k.to_lowercase(), v.clone()))
-            .collect();
-
+        let headers_lower: HashMap<String, String> = headers.iter().map(|(k, v)| (k.to_lowercase(), v.clone())).collect();
         let required = [
             ("content-security-policy", "Content-Security-Policy"),
             ("strict-transport-security", "HSTS"),
             ("x-frame-options", "X-Frame-Options"),
             ("x-content-type-options", "X-Content-Type-Options"),
         ];
-
         for (header, name) in &required {
             if !headers_lower.contains_key(*header) {
                 missing.push(name.to_string());
@@ -1084,22 +1426,17 @@ impl ReconEngine {
     async fn generate_curl_commands(&self) -> Vec<String> {
         let requests = self.requests.lock().await;
         let mut commands = Vec::new();
-
         for (_, req) in requests.iter() {
             if is_static(&req.url) { continue; }
-
             let mut cmd = format!("curl -X {} '{}'", req.method, req.url);
-
             for (key, value) in &req.headers {
                 let key_lower = key.to_lowercase();
                 if key_lower == "host" || key_lower == "content-length" || key_lower == "connection" { continue; }
                 cmd.push_str(&format!(" \\\n  -H '{}: {}'", key, value.replace('\'', "\\'")));
             }
-
             if let Some(body) = &req.body {
                 cmd.push_str(&format!(" \\\n  -d '{}'", body.replace('\'', "\\'")));
             }
-
             commands.push(cmd);
         }
         commands
@@ -1108,10 +1445,8 @@ impl ReconEngine {
     async fn generate_python_requests(&self) -> Vec<String> {
         let requests = self.requests.lock().await;
         let mut scripts = Vec::new();
-
         for (_, req) in requests.iter() {
             if is_static(&req.url) { continue; }
-
             let mut script = String::from("import requests\n\n");
             script.push_str("headers = {\n");
             for (key, value) in &req.headers {
@@ -1120,7 +1455,6 @@ impl ReconEngine {
                 script.push_str(&format!("    '{}': '{}',\n", key, value.replace('\'', "\\'")));
             }
             script.push_str("}\n\n");
-
             let method_lower = req.method.to_lowercase();
             if let Some(body) = &req.body {
                 script.push_str(&format!(
@@ -1131,7 +1465,6 @@ impl ReconEngine {
             } else {
                 script.push_str(&format!("response = requests.{}('{}', headers=headers)\n", method_lower, req.url));
             }
-
             script.push_str("print(response.status_code)\nprint(response.text)\n");
             scripts.push(script);
         }
@@ -1141,29 +1474,22 @@ impl ReconEngine {
     async fn generate_raw_http(&self) -> Vec<String> {
         let requests = self.requests.lock().await;
         let mut raw_reqs = Vec::new();
-
         for (_, req) in requests.iter() {
             if is_static(&req.url) { continue; }
-
             let url_parsed = url::Url::parse(&req.url).ok();
             let path = url_parsed.as_ref().map(|u| {
                 let p = u.path();
                 if let Some(q) = u.query() { format!("{}?{}", p, q) } else { p.to_string() }
             }).unwrap_or("/".to_string());
-
             let host = url_parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("unknown");
-
             let mut raw = format!("{} {} HTTP/1.1\r\n", req.method, path);
             raw.push_str(&format!("Host: {}\r\n", host));
-
             for (key, value) in &req.headers {
                 if key.to_lowercase() == "host" { continue; }
                 raw.push_str(&format!("{}: {}\r\n", key, value));
             }
-
             raw.push_str("\r\n");
             if let Some(body) = &req.body { raw.push_str(body); }
-
             raw_reqs.push(raw);
         }
         raw_reqs
@@ -1173,7 +1499,7 @@ impl ReconEngine {
     // Report Generation
     // ========================================================================
 
-    async fn generate_report(&self, target: &str) -> ReconReport {
+    async fn generate_report(&self, target: &str, cookie_jar: Option<CookieJar>) -> ReconReport {
         let requests = self.requests.lock().await;
         let responses = self.responses.lock().await;
         let websockets = self.websockets.lock().await;
@@ -1191,6 +1517,11 @@ impl ReconEngine {
             captured_requests: requests.values().cloned().collect(),
             captured_responses: responses.values().cloned().collect(),
             request_response_pairs: pairs,
+            intercepted_requests: self.intercepted_requests.lock().await.clone(),
+            cookie_jar,
+            xhr_replays: self.xhr_replays.lock().await.clone(),
+            secrets_found: self.secrets_found.lock().await.clone(),
+            security_issues: self.security_issues.lock().await.clone(),
             websocket_connections: websockets.values().cloned().collect(),
             login_forms: self.login_forms.lock().await.clone(),
             registration_forms: self.registration_forms.lock().await.clone(),
@@ -1200,7 +1531,6 @@ impl ReconEngine {
             graphql_operations: self.graphql_ops.lock().await.clone(),
             auth_findings: self.auth_findings.lock().await.clone(),
             antibot_findings: self.antibot_findings.lock().await.clone(),
-            security_findings: self.security_findings.lock().await.clone(),
             missing_headers: self.header_findings.lock().await.clone(),
             interesting_urls: self.interesting_urls.lock().await.clone(),
             curl_commands: self.generate_curl_commands().await,
@@ -1234,8 +1564,7 @@ fn is_static(url: &str) -> bool {
 fn should_capture_body(mime_type: &str) -> bool {
     let mime_lower = mime_type.to_lowercase();
     mime_lower.contains("json") || mime_lower.contains("xml") || mime_lower.contains("text/html")
-        || mime_lower.contains("text/plain") || mime_lower.contains("javascript")
-        || mime_lower.contains("graphql")
+        || mime_lower.contains("text/plain") || mime_lower.contains("javascript") || mime_lower.contains("graphql")
 }
 
 fn is_jwt(token: &str) -> bool {
@@ -1253,17 +1582,16 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn parse_cookies(cookie_header: Option<&String>) -> Vec<Cookie> {
     cookie_header.map(|h| {
-        h.split(';')
-            .filter_map(|c| {
-                let mut parts = c.trim().splitn(2, '=');
-                Some(Cookie {
-                    name: parts.next()?.to_string(),
-                    value: parts.next().unwrap_or("").to_string(),
-                    domain: None, path: None, expires: None,
-                    http_only: false, secure: false, same_site: None,
-                })
+        h.split(';').filter_map(|c| {
+            let mut parts = c.trim().splitn(2, '=');
+            Some(Cookie {
+                name: parts.next()?.to_string(),
+                value: parts.next().unwrap_or("").to_string(),
+                domain: None, path: None, expires: None,
+                http_only: false, secure: false, same_site: None,
+                priority: None, source_scheme: None,
             })
-            .collect()
+        }).collect()
     }).unwrap_or_default()
 }
 
@@ -1273,37 +1601,28 @@ fn parse_set_cookie(value: &str) -> Cookie {
         name: String::new(), value: String::new(),
         domain: None, path: None, expires: None,
         http_only: false, secure: false, same_site: None,
+        priority: None, source_scheme: None,
     };
-
     if let Some(first) = parts.first() {
         let mut kv = first.splitn(2, '=');
         cookie.name = kv.next().unwrap_or("").trim().to_string();
         cookie.value = kv.next().unwrap_or("").trim().to_string();
     }
-
     for part in parts.iter().skip(1) {
         let part_lower = part.to_lowercase();
         let part_trimmed = part.trim();
-
-        if part_lower.contains("httponly") {
-            cookie.http_only = true;
-        } else if part_lower.trim() == "secure" {
-            cookie.secure = true;
-        } else if part_lower.contains("domain=") {
-            cookie.domain = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
-        } else if part_lower.contains("path=") {
-            cookie.path = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
-        } else if part_lower.contains("expires=") {
-            cookie.expires = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
-        } else if part_lower.contains("samesite=") {
-            cookie.same_site = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string());
-        }
+        if part_lower.contains("httponly") { cookie.http_only = true; }
+        else if part_lower.trim() == "secure" { cookie.secure = true; }
+        else if part_lower.contains("domain=") { cookie.domain = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string()); }
+        else if part_lower.contains("path=") { cookie.path = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string()); }
+        else if part_lower.contains("expires=") { cookie.expires = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string()); }
+        else if part_lower.contains("samesite=") { cookie.same_site = Some(part_trimmed.split('=').nth(1).unwrap_or("").to_string()); }
     }
     cookie
 }
 
 // ============================================================================
-// JavaScript
+// JavaScript for Client-Side Analysis
 // ============================================================================
 
 const RECON_JS: &str = r#"
@@ -1351,18 +1670,9 @@ const RECON_JS: &str = r#"
                 }
             } catch(e) {}
             return result;
-        },
-        findAuthPatterns: function() {
-            const html = document.documentElement.innerHTML.toLowerCase();
-            const patterns = [];
-            if (html.includes('csrf') || html.includes('_token')) patterns.push('CSRF');
-            if (html.includes('jwt')) patterns.push('JWT');
-            if (html.includes('oauth')) patterns.push('OAuth');
-            if (html.includes('2fa') || html.includes('mfa')) patterns.push('MFA');
-            return patterns;
         }
     };
-    console.log('[RECON] v3 loaded');
+    console.log('[RECON] v4 loaded - TIER 1 features enabled');
 })();
 "#;
 
@@ -1376,15 +1686,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     let target = args.get(1).map(|s| s.as_str()).unwrap_or("https://example.com");
-    let export_format = args.get(2).map(|s| s.as_str()).unwrap_or("all");
+    let intercept_mode = args.iter().any(|a| a == "--intercept");
+    let export_format = args.iter().find(|a| a.starts_with("--export"))
+        .and_then(|_| args.iter().skip_while(|a| *a != "--export").nth(1))
+        .map(|s| s.as_str())
+        .unwrap_or("all");
 
     println!("\n{}", "═".repeat(70));
-    println!(" WEB RECON TOOL v3 - Bug Bounty Edition");
+    println!(" WEB RECON TOOL v4 - TIER 1 Features");
     println!(" Target: {}", target);
+    println!(" Intercept Mode: {}", intercept_mode);
     println!("{}", "═".repeat(70));
     println!();
 
-    let engine = Arc::new(ReconEngine::new());
+    let engine = Arc::new(ReconEngine::new(intercept_mode));
 
     println!("[*] Launching browser...");
     let config = BrowserConfig::builder()
@@ -1400,6 +1715,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page = browser.new_page("about:blank").await?;
     page.enable_stealth_mode().await?;
 
+    // Enable Audits domain for security issues
+    println!("[*] Enabling Audits domain...");
+    page.execute(AuditsEnableParams::default()).await?;
+
+    // Enable Fetch domain for interception if requested
+    if intercept_mode {
+        println!("[*] Enabling Fetch domain for interception...");
+        let fetch_params = FetchEnableParams::builder()
+            .pattern(RequestPattern::builder().url_pattern("*").build())
+            .build();
+        page.execute(fetch_params).await?;
+    }
+
     // Event listeners
     let mut req_events = page.event_listener::<EventRequestWillBeSent>().await?;
     let mut resp_events = page.event_listener::<EventResponseReceived>().await?;
@@ -1407,8 +1735,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ws_sent = page.event_listener::<EventWebSocketFrameSent>().await?;
     let mut ws_recv = page.event_listener::<EventWebSocketFrameReceived>().await?;
     let mut ws_closed = page.event_listener::<EventWebSocketClosed>().await?;
+    let mut audit_events = page.event_listener::<EventIssueAdded>().await?;
 
-    // Spawn handlers
+    // Spawn request handler
     let engine_req = Arc::clone(&engine);
     let req_handle = tokio::spawn(async move {
         while let Some(event) = req_events.next().await {
@@ -1416,6 +1745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn response handler
     let engine_resp = Arc::clone(&engine);
     let resp_handle = tokio::spawn(async move {
         while let Some(event) = resp_events.next().await {
@@ -1423,17 +1753,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn WebSocket handlers
     let engine_ws1 = Arc::clone(&engine);
     tokio::spawn(async move { while let Some(e) = ws_created.next().await { engine_ws1.handle_websocket_created(&e).await; } });
-
     let engine_ws2 = Arc::clone(&engine);
     tokio::spawn(async move { while let Some(e) = ws_sent.next().await { engine_ws2.handle_websocket_frame_sent(&e).await; } });
-
     let engine_ws3 = Arc::clone(&engine);
     tokio::spawn(async move { while let Some(e) = ws_recv.next().await { engine_ws3.handle_websocket_frame_received(&e).await; } });
-
     let engine_ws4 = Arc::clone(&engine);
     tokio::spawn(async move { while let Some(e) = ws_closed.next().await { engine_ws4.handle_websocket_closed(&e).await; } });
+
+    // Spawn audit handler (TIER 1)
+    let engine_audit = Arc::clone(&engine);
+    tokio::spawn(async move {
+        while let Some(event) = audit_events.next().await {
+            engine_audit.handle_security_issue(&event).await;
+        }
+    });
+
+    // Intercept handler (TIER 1)
+    if intercept_mode {
+        let mut intercept_events = page.event_listener::<EventRequestPaused>().await?;
+        let engine_intercept = Arc::clone(&engine);
+        let page_clone = page.clone();
+        tokio::spawn(async move {
+            while let Some(event) = intercept_events.next().await {
+                let intercepted = engine_intercept.handle_intercepted_request(&event).await;
+
+                // Continue or block based on analysis
+                if intercepted.action_taken == "blocked" {
+                    let fail_params = FailRequestParams::new(
+                        event.request_id.clone(),
+                        chromiumoxide::cdp::browser_protocol::network::ErrorReason::BlockedByClient
+                    );
+                    let _ = page_clone.execute(fail_params).await;
+                } else {
+                    let continue_params = ContinueRequestParams::new(event.request_id.clone());
+                    let _ = page_clone.execute(continue_params).await;
+                }
+            }
+        });
+    }
 
     // Inject JS
     page.evaluate_on_new_document(RECON_JS).await?;
@@ -1450,9 +1810,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)").await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-    // Fetch bodies
-    println!("\n[*] Fetching request/response bodies...");
+    // TIER 1: Dump cookie jar
+    let cookie_jar = engine.dump_cookie_jar(&page).await;
+
+    // Fetch bodies with secret scanning
+    println!("\n[*] Fetching request/response bodies (with secret scanning)...");
     engine.fetch_pending_bodies(&page).await;
+
+    // TIER 1: Replay XHR requests
+    engine.replay_xhr_requests(&page).await;
 
     // Client analysis
     println!("\n[*] Client-side analysis...");
@@ -1480,33 +1846,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report
     println!("\n{}", "═".repeat(70));
-    println!(" RECON REPORT");
+    println!(" RECON REPORT v4 - TIER 1");
     println!("{}", "═".repeat(70));
 
-    let report = engine.generate_report(target).await;
+    let report = engine.generate_report(target, cookie_jar).await;
 
-    println!("\nTotal Requests: {}", report.total_requests);
+    println!("\n--- Summary ---");
+    println!("Total Requests: {}", report.total_requests);
     println!("API Endpoints: {}", report.api_endpoints.len());
     println!("WebSocket Connections: {}", report.websocket_connections.len());
     println!("Tokens Captured: {}", report.captured_tokens.len());
-    println!("Auth Flows: {}", report.auth_flows.len());
     println!("Requests with Bodies: {}", report.captured_requests.iter().filter(|r| r.body.is_some()).count());
     println!("Responses with Bodies: {}", report.captured_responses.iter().filter(|r| r.body.is_some()).count());
 
+    println!("\n--- TIER 1: New Features ---");
+    println!("Intercepted Requests: {}", report.intercepted_requests.len());
+    if let Some(jar) = &report.cookie_jar {
+        println!("Cookies Dumped: {} (Secure:{}, HttpOnly:{}, Session:{})",
+            jar.total_count, jar.secure_count, jar.http_only_count, jar.session_cookies);
+    }
+    println!("XHR Replays: {}", report.xhr_replays.len());
+    println!("Secrets Found: {}", report.secrets_found.len());
+    println!("Security Issues: {}", report.security_issues.len());
+
+    if !report.secrets_found.is_empty() {
+        println!("\n--- SECRETS FOUND ---");
+        for secret in &report.secrets_found {
+            println!("  [!] {} - {}", secret.pattern_name, truncate(&secret.matched_value, 50));
+        }
+    }
+
+    if !report.security_issues.is_empty() {
+        println!("\n--- SECURITY ISSUES ---");
+        for issue in &report.security_issues {
+            println!("  [{}] {} - {}", issue.severity, issue.issue_code, issue.description);
+        }
+    }
+
     println!("\n--- API Endpoints ({}) ---", report.api_endpoints.len());
     for api in &report.api_endpoints { println!("  {} {} {}", api.method, api.api_type, truncate(&api.url, 50)); }
-
-    println!("\n--- WebSocket ({}) ---", report.websocket_connections.len());
-    for ws in &report.websocket_connections { println!("  {} - {} messages", truncate(&ws.url, 40), ws.messages.len()); }
-
-    println!("\n--- Captured Tokens ({}) ---", report.captured_tokens.len());
-    for token in &report.captured_tokens { println!("  [{}] {} @ {}", token.token_type, token.name, token.location); }
-
-    println!("\n--- Auth Flows ({}) ---", report.auth_flows.len());
-    for flow in &report.auth_flows { println!("  {} - {} steps", flow.flow_type, flow.steps.len()); }
-
-    println!("\n--- Security ({}) ---", report.security_findings.len());
-    for f in &report.security_findings { println!("  [!] {}", f.finding_type); }
 
     println!("\n--- Missing Headers ---");
     for h in &report.missing_headers { println!("  [!] {}", h); }
@@ -1536,8 +1914,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n{}", "═".repeat(70));
-    println!(" Complete - {} requests, {} with bodies", report.total_requests,
-        report.captured_requests.iter().filter(|r| r.body.is_some()).count());
+    println!(" Complete - TIER 1 Features Active");
+    println!(" {} requests | {} secrets | {} issues",
+        report.total_requests, report.secrets_found.len(), report.security_issues.len());
     println!("{}", "═".repeat(70));
 
     drop(req_handle);
